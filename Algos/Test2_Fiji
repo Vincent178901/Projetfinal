@@ -1,0 +1,116 @@
+# filtre_contraste_bgsub_v3.py
+# Dépendances : pip install opencv-python numpy
+
+from pathlib import Path
+import cv2
+import numpy as np
+import shutil
+
+# --- Dossiers ---
+IN_DIR = Path("images_test/contrastenette")
+KEEP_DIR = IN_DIR.parent / "contrastenette_keep"
+KEEP_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Paramètres ---
+THRESH_STD   = 10.0   # seuil StdDev après soustraction de fond
+THRESH_COV   = 0.08   # ~8% de couverture d'edges dans la zone droite (à ajuster 0.05–0.15)
+ROLLING_RADIUS = 500  # équivalent rolling ball radius (pixels)
+ROI_RIGHT_RATIO = 0.6 # on évalue la couverture sur le dernier 40% de l'image
+EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+def to_gray_8bit(img):
+    """Convertit n'importe quelle image en 8-bit grayscale [0,255]."""
+    if img is None:
+        return None
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.dtype == np.uint8:
+        gray8 = img
+    elif img.dtype == np.uint16:
+        gray8 = cv2.convertScaleAbs(img, alpha=255.0 / 65535.0)
+    else:
+        imin, imax = float(img.min()), float(img.max())
+        gray8 = ((img - imin) / (imax - imin) * 255.0).astype(np.uint8) if imax > imin else np.zeros_like(img, dtype=np.uint8)
+    return gray8
+
+def subtract_background(img, radius=500):
+    """Soustrait le fond lent (approx rolling ball par flou gaussien large)."""
+    sigma = radius / 3.0
+    bg = cv2.GaussianBlur(img, (0, 0), sigma)
+    corrected = cv2.subtract(img, bg)
+    return corrected
+
+def connector_coverage_score(corrected, roi_right_ratio=0.6):
+    """
+    Mesure la fraction de pixels 'edge' (Sobel horizontal) dans la zone droite.
+    Étapes: (1) léger blur -> (2) Sobel Gx -> (3) Otsu sur la ROI -> (4) couverture [0..1]
+    """
+    # petit lissage pour stabiliser le seuillage
+    sm = cv2.GaussianBlur(corrected, (0, 0), 1.0)
+
+    # gradient horizontal (stries verticales -> |Gx| fort)
+    gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
+    mag = np.abs(gx)
+
+    H, W = mag.shape
+    x0 = int(W * roi_right_ratio)  # on regarde la partie droite
+    roi = mag[:, x0:]
+
+    # normalisation -> u8 puis Otsu
+    roi_u8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(roi_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    coverage = float(np.count_nonzero(mask)) / mask.size
+    return coverage
+
+# --- Mode A : filtrer par 2 critères (StdDev + couverture) ---
+for p in sorted(IN_DIR.iterdir()):
+    if not p.is_file() or p.suffix.lower() not in EXTS:
+        continue
+
+    img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    gray = to_gray_8bit(img)
+    if gray is None:
+        print(f"⚠️ Erreur de lecture: {p.name}")
+        continue
+
+    corrected = subtract_background(gray, radius=ROLLING_RADIUS)
+    std_corr = float(np.std(corrected))
+
+    if std_corr <= THRESH_STD:
+        print(f"❌ {p.name} rejetée (StdDev_corr={std_corr:.2f} ≤ {THRESH_STD})")
+        continue
+
+    cov = connector_coverage_score(corrected, roi_right_ratio=ROI_RIGHT_RATIO)
+    if cov > THRESH_COV:
+        shutil.copy2(p, KEEP_DIR / p.name)
+        print(f"✅ {p.name} gardée (StdDev_corr={std_corr:.2f}, coverage={cov:.3f})")
+    else:
+        print(f"❌ {p.name} rejetée (coverage={cov:.3f} ≤ {THRESH_COV})")
+
+# --- Mode B : garder UNE SEULE image (la meilleure couverture) ---
+# Dé-commente si tu veux garder uniquement la plus “connecteur”.
+# candidates = []
+# for p in sorted(IN_DIR.iterdir()):
+#     if not p.is_file() or p.suffix.lower() not in EXTS: 
+#         continue
+#     img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+#     gray = to_gray_8bit(img)
+#     if gray is None: 
+#         continue
+#     corr = subtract_background(gray, radius=ROLLING_RADIUS)
+#     std_corr = float(np.std(corr))
+#     if std_corr <= THRESH_STD:
+#         continue
+#     cov = connector_coverage_score(corr, roi_right_ratio=ROI_RIGHT_RATIO)
+#     candidates.append((p, cov, std_corr))
+#
+# if candidates:
+#     best = max(candidates, key=lambda t: t[1])  # max coverage
+#     shutil.copy2(best[0], KEEP_DIR / best[0].name)
+#     print(f"\n🏆 GARDÉE SEULE: {best[0].name} (coverage={best[1]:.3f}, StdDev_corr={best[2]:.2f})")
+# else:
+#     print("\nAucune image ne passe le seuil StdDev.")
+
+
+

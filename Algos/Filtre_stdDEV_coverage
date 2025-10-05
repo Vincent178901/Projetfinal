@@ -1,0 +1,85 @@
+
+from pathlib import Path
+import cv2
+import numpy as np
+import shutil
+
+IN_DIR = Path("images_test/contrasteflou")
+KEEP_DIR = IN_DIR.parent / "contrasteflou_keep"
+KEEP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Paramètre
+THRESH_STD   = 5.0         # seuil minimal pour considérer l'image
+ROLLING_RADIUS = 500       # équivalent rolling ball radius (pixels)
+ROI_RIGHT_RATIO = 0.6      # zone droite où se trouve le connecteur
+W_STD = 0.7                # poids du StdDev dans le score combiné
+W_COV = 0.3                # poids du coverage dans le score combiné
+EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+def to_gray_8bit(img):
+    #Convertit image en 8-bit grayscale [0,255]
+    if img is None:
+        return None
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.dtype == np.uint8:
+        gray8 = img
+    elif img.dtype == np.uint16:
+        gray8 = cv2.convertScaleAbs(img, alpha=255.0 / 65535.0)
+    else:
+        imin, imax = float(img.min()), float(img.max())
+        gray8 = ((img - imin) / (imax - imin) * 255.0).astype(np.uint8) if imax > imin else np.zeros_like(img, dtype=np.uint8)
+    return gray8
+
+def subtract_background(img, radius=500):
+    #Soustrait le fond lent qui detecte du contraste
+    sigma = radius / 3.0
+    bg = cv2.GaussianBlur(img, (0, 0), sigma)
+    corrected = cv2.subtract(img, bg)
+    return corrected
+
+def connector_coverage_score(corrected, roi_right_ratio=0.6):
+    #Mesure la densité de gradient apres avoir soustrait background
+    sm = cv2.GaussianBlur(corrected, (0, 0), 1.0)
+    gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
+    mag = np.abs(gx)
+    H, W = mag.shape
+    x0 = int(W * roi_right_ratio)
+    roi = mag[:, x0:]
+    roi_u8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(roi_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    coverage = float(np.count_nonzero(mask)) / mask.size
+    return coverage
+
+#Parcours des images et calcul des scores
+candidates = []
+for p in sorted(IN_DIR.iterdir()):
+    if not p.is_file() or p.suffix.lower() not in EXTS:
+        continue
+
+    img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    gray = to_gray_8bit(img)
+    if gray is None:
+        print(f"⚠️ Erreur de lecture: {p.name}")
+        continue
+
+    corrected = subtract_background(gray, radius=ROLLING_RADIUS)
+    std_corr = float(np.std(corrected))
+
+    if std_corr < THRESH_STD:
+        print(f" {p.name} ignorée (StdDev={std_corr:.2f})")
+        continue
+
+    cov = connector_coverage_score(corrected, roi_right_ratio=ROI_RIGHT_RATIO)
+    score = W_STD * std_corr + W_COV * (cov * 100)  # coverage mis à l’échelle
+    candidates.append((p, std_corr, cov, score))
+    print(f"{p.name} → StdDev={std_corr:.2f}, coverage={cov:.3f}, score={score:.2f}")
+
+# Sélection de la meilleure image
+if candidates:
+    best = max(candidates, key=lambda t: t[3])  # t[3] = score combiné
+    shutil.copy2(best[0], KEEP_DIR / best[0].name)
+    print(f"\n GARDÉE : {best[0].name}")
+    print(f"   StdDev={best[1]:.2f} | coverage={best[2]:.3f} | score={best[3]:.2f}")
+else:
+    print("\nAucune image ne passe le seuil minimal de StdDev.")

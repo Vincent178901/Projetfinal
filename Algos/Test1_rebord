@@ -1,0 +1,353 @@
+# fichier: tools/detect_best_edge.py
+import argparse, os, glob, cv2, numpy as np, shutil
+
+# ================== RÉGLAGES PAR DÉFAUT ==================
+# Lissage du profil 1D (moyenne de colonnes)
+SMOOTH_PROFILE = 11
+
+# Prior centré (facultatif)
+USE_CENTER_PRIOR = True
+CENTER_GAIN = 1.2
+CENTER_SIGMA_FRACTION = 0.16    # σ en fraction de la largeur
+
+# Polarité & fenêtre spatiale (0..1)
+EDGE_POLARITY = "any"           # "rising"(sombre->clair) | "falling" | "any"
+X_WINDOW_FRAC = (0.0, 1.0)
+
+# Prétraitement tonal (invariance à la clarté)
+USE_CLAHE = False
+CLAHE_CLIP = 2.0
+CLAHE_TILE = (8, 8)
+
+# Vote par fenêtres (moyenne de colonnes)
+BOX_WIN_FRAC   = 0.04           # largeur de chaque boîte L/R (fraction de W)
+BOX_GAP_FRAC   = 0.02           # petit gap au centre
+CONSENSUS_MIN  = 0.60           # % mini de colonnes cohérentes (0..1)
+CONSENSUS_POW  = 1.0            # puissance appliquée au consensus dans le score
+
+# Filtres anti-faux positifs (validation stricte)
+MIN_STEP_SNR   = 7.0            # SNR de marche (grand = vrai rebord)
+MAX_FWHM_FRAC  = 0.12           # pic étroit (petit = vrai rebord)
+# =========================================================
+
+
+# ---------- utilitaires ----------
+def preprocess(gray: np.ndarray) -> np.ndarray:
+    """Égalisation locale optionnelle (CLAHE) -> robustesse aux images plus sombres/claires."""
+    if not USE_CLAHE:
+        return gray
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+    return clahe.apply(gray)
+
+def to_uint8_0_255(arr: np.ndarray) -> np.ndarray:
+    """Normalise un vecteur en [0..255] (compatible NumPy 2.x)."""
+    arr = np.asarray(arr, dtype=np.float32)
+    mn  = float(np.min(arr))
+    rng = float(np.ptp(arr))  # équivaut à max-min
+    if rng < 1e-12:
+        rng = 1e-12
+    out = (arr - mn) / rng
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+def list_images_recursive(folder, pattern="*.png"):
+    return sorted(glob.glob(os.path.join(folder, "**", pattern), recursive=True))
+
+def ensure_clean_overlays(overlay_root):
+    if os.path.exists(overlay_root):
+        shutil.rmtree(overlay_root)
+    os.makedirs(overlay_root, exist_ok=True)
+
+def save_overlay(img_gray, x_edge, z_conf, step_snr, fwhm_frac, consensus, score,
+                 out_path, dist_to_center=None, note=""):
+    """Dessine centre (vert) et bord (bleu) + métriques."""
+    h, w = img_gray.shape
+    vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    x_mid = w // 2
+    cv2.line(vis, (x_mid, 0), (x_mid, h-1), (0,255,0), 1)  # centre
+
+    status = ""
+    if x_edge is not None:
+        x_edge = int(x_edge)
+        cv2.line(vis, (x_edge, 0), (x_edge, h-1), (255,0,0), 1)  # bord
+        if dist_to_center is None:
+            dist_to_center = abs(x_edge - x_mid)
+    else:
+        status = " (NO_EDGE)"
+        if dist_to_center is None:
+            dist_to_center = 0
+
+    label = (f"x={-1 if x_edge is None else x_edge}"
+             f" z={z_conf:.1f} S={step_snr:.1f} W={fwhm_frac:.2f}"
+             f" C={consensus:.2f} score={score:.1f} d={dist_to_center}px{status}{note}")
+    cv2.putText(vis, label, (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv2.imwrite(out_path, vis)
+
+def integ(arr: np.ndarray) -> np.ndarray:
+    """Sommes cumulées 1D robustes (force la forme 1D)."""
+    arr1d = np.asarray(arr, dtype=np.float64).ravel()
+    return np.cumsum(np.concatenate([np.array([0.0], dtype=np.float64), arr1d]))
+
+
+def detect_edge_and_score(gray):
+    """
+    Détection robuste d’un rebord (marche gauche/droite) :
+      1) Profil colonne p[x] = médiane en Y + lissage (mieux que moyenne si texture)
+      2) Change-point spatial : on cherche k qui maximise |mR - mL| / MAD_pooled
+      3) Edge local : pic de dérivée |dp/dx| à k, FWHM (étroitesse), et "peak ratio"
+      4) (Option) consensus sombre|clair via Otsu sur p (vote par colonnes)
+      5) Score global et validation (SNR_global, FWHM, peak_ratio, consensus)
+
+    Retourne (x_edge|None, z_conf, step_snr_global, fwhm_frac, consensus, score)
+    """
+    H, W = gray.shape[:2]
+    x_mid = W // 2
+    x = np.arange(W)
+
+    # --- 0) Prétraitement tonal (CLAHE optionnel) ---
+    g0 = preprocess(gray)
+
+    # --- 1) Profil colonne : médiane verticale (plus robuste aux stries) ---
+    p = np.median(g0, axis=0).astype(np.float32)
+
+    # Lissage 1D léger
+    if SMOOTH_PROFILE > 1:
+        k = SMOOTH_PROFILE
+        p = np.convolve(p, np.ones(k, np.float32)/k, mode="same")
+
+    # --- 2) Change-point (rupture spatiale contiguë) ---
+    # Cumul pour moyens rapides
+    cs   = np.cumsum(np.concatenate([[0.0], p]))
+    cs2  = np.cumsum(np.concatenate([[0.0], p*p]))
+    def seg_stats(a, b):
+        n = max(1, b - a)
+        s = cs[b] - cs[a]
+        s2= cs2[b] - cs2[a]
+        mean = s / n
+        var  = max(0.0, s2/n - mean*mean)
+        return n, mean, var
+
+    # On évite des segments minuscules (coupe trop bordure)
+    MIN_FRAC = 0.12            # au moins 12% de largeur de chaque côté
+    k0 = int(MIN_FRAC * W); k1 = W - k0
+
+    # SNR global sur rupture : |mR - mL| / MAD_pooled
+    # (MAD pooled approximée par sqrt(varL + varR) mais on peut aussi faire MAD)
+    best_k, best_snr = k0, -1e9
+    for k in range(k0, k1):
+        nL, mL, vL = seg_stats(0, k)
+        nR, mR, vR = seg_stats(k, W)
+        # Polarité
+        diff = (mR - mL) if EDGE_POLARITY != "falling" else (mL - mR)
+        if EDGE_POLARITY == "any":
+            diff = abs(mR - mL)
+        denom = np.sqrt(max(vL, 1e-9) + max(vR, 1e-9))
+        snr_k = diff / max(denom, 1e-9)
+        if snr_k > best_snr:
+            best_snr, best_k = snr_k, k
+
+    k = int(best_k)
+    step_snr_global = float(best_snr)  # S (global)
+
+    # --- 3) Edge local : dérivée + FWHM + peakiness ---
+    # Dérivée (gradient 1D) du profil
+    gp = np.abs(np.gradient(p))
+    # Pic local pris à k, pas forcément exactement au max(gp)
+    # -> on peut raffiner dans un petit voisinage
+    RADIUS = max(2, int(0.01 * W))
+    k_loc = int(np.argmax(gp[max(0, k-RADIUS):min(W, k+RADIUS+1)]) + max(0, k-RADIUS))
+    k = k_loc
+
+    # FWHM du pic
+    half = 0.5 * gp[k]
+    iL = k
+    while iL > 0 and gp[iL] >= half: iL -= 1
+    iR = k
+    while iR < W-1 and gp[iR] >= half: iR += 1
+    fwhm = max(1, iR - iL)
+    fwhm_frac = float(fwhm / max(W, 1))
+
+    # Peak ratio (piquant) : pic / fond (moyenne anneau)
+    R_IN  = max(4, int(0.01 * W))
+    R_OUT = max(R_IN+4, int(0.04 * W))
+    left_bg  = gp[max(0, k-R_OUT):max(0, k-R_IN)]
+    right_bg = gp[min(W, k+R_IN):min(W, k+R_OUT)]
+    bg = np.concatenate([left_bg, right_bg]) if left_bg.size+right_bg.size>0 else np.array([1.0], np.float32)
+    peak_ratio = float(gp[k] / (bg.mean() + 1e-6))
+
+    # --- 4) Consensus (optionnel) par Otsu 1D sur p ---
+    p8 = to_uint8_0_255(p)
+    t, _ = cv2.threshold(p8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    b = (p8 >= t).astype(np.float32)
+    # votes à gauche/droite dans des fenêtres proches de k
+    BOX = max(3, int(0.06 * W))
+    GAP = max(1, int(0.01 * W))
+    L0 = max(0, k - GAP - BOX); L1 = max(0, k - GAP)
+    R0 = min(W, k + GAP);       R1 = min(W, k + GAP + BOX)
+    if L1 <= L0 or R1 <= R0:
+        consensus = 0.0
+    else:
+        meanbL = b[L0:L1].mean()
+        meanbR = b[R0:R1].mean()
+        cons_rising  = min(1.0 - meanbL, meanbR)   # sombre|clair
+        cons_falling = min(meanbL, 1.0 - meanbR)   # clair|sombre
+        if EDGE_POLARITY == "rising":  consensus = cons_rising
+        elif EDGE_POLARITY == "falling": consensus = cons_falling
+        else: consensus = max(cons_rising, cons_falling)
+
+    # --- 5) Prior centré & fenêtre ---
+    if USE_CENTER_PRIOR:
+        c_sigma = max(3.0, CENTER_SIGMA_FRACTION * W)
+        center_w = 1.0 + CENTER_GAIN * np.exp(-0.5 * ((k - x_mid)/c_sigma)**2)
+    else:
+        center_w = 1.0
+    # Fenêtre globale (si limitée)
+    x0 = int(np.clip(X_WINDOW_FRAC[0], 0.0, 1.0) * W)
+    x1 = int(np.clip(X_WINDOW_FRAC[1], 0.0, 1.0) * W)
+    if not (x0 <= k < x1):
+        return None, max(step_snr_global, 0.0), step_snr_global, fwhm_frac, consensus, 0.0
+
+    # --- 6) Score global & validation ---
+    # Poids : marche globale forte + pic local piquant + centre
+    score = float(step_snr_global * peak_ratio / (fwhm_frac + 1e-6) * center_w)
+
+    # Seuils de validation (à ajuster suivant ton besoin)
+    MIN_SNR_G = 6.0         # plus haut => rejette gradients doux
+    MAX_W     = 0.14        # plus bas => exige transition très étroite
+    MIN_PR    = 2.0         # pic au moins 2x le fond
+    MIN_CONS  = 0.55        # consensus mini (utile quand bcp de bruit)
+
+    accept = (step_snr_global >= MIN_SNR_G) and (fwhm_frac <= MAX_W) and (peak_ratio >= MIN_PR) and (consensus >= MIN_CONS)
+
+    if not accept:
+        # On retourne NO_EDGE mais on garde les métriques pour overlay/debug
+        z_conf = max(step_snr_global, 0.0)
+        return None, z_conf, step_snr_global, fwhm_frac, consensus, score
+
+    z_conf = max(step_snr_global, 0.0)
+    return int(k), z_conf, step_snr_global, fwhm_frac, consensus, score
+
+
+
+# ---------- pipeline dossier ----------
+def main(folder, pattern="*.png", save_overlays=True, select_by="score"):
+    os.makedirs(folder, exist_ok=True)
+    files = list_images_recursive(folder, pattern)
+    if not files:
+        print(f"[!] Aucune image trouvée dans: {folder} (pattern: {pattern})")
+        return 1
+
+    overlay_root = os.path.join(folder, "overlays")
+    if save_overlays:
+        ensure_clean_overlays(overlay_root)
+
+    results = []
+    for path in files:
+        rel = os.path.relpath(path, start=folder)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+
+        h, w = img.shape
+        x_mid = w // 2
+
+        x_edge, z_conf, S, Wfrac, C, score = detect_edge_and_score(img)
+        dist = None if x_edge is None else abs(int(x_edge) - x_mid)
+
+        if save_overlays:
+            outp = os.path.join(overlay_root, rel)
+            save_overlay(img, x_edge, z_conf, S, Wfrac, C, score, outp,
+                         dist_to_center=0 if dist is None else dist)
+
+        results.append({
+            "rel": rel,
+            "full": path,
+            "x": None if x_edge is None else int(x_edge),
+            "z": float(z_conf),
+            "S": float(S),
+            "W": float(Wfrac),
+            "C": float(C),
+            "score": float(score),
+            "dist": int(1e9 if dist is None else dist),
+            "accepted": (x_edge is not None),
+            "Wpx": w
+        })
+
+    if not results:
+        print("[!] Aucune image lisible.")
+        return 2
+
+    # tri pour la "meilleure" image
+    accepted = [r for r in results if r["accepted"]]
+    pool = accepted if accepted else results  # fallback: si rien d'accepté, on prend le meilleur score
+
+    if select_by == "center":
+        pool.sort(key=lambda d: (d["dist"], -d["score"]))
+    elif select_by == "z":
+        pool.sort(key=lambda d: (-d["z"], d["dist"]))
+    elif select_by == "consensus":
+        pool.sort(key=lambda d: (-d["C"], -d["score"]))
+    else:  # "score"
+        pool.sort(key=lambda d: (-d["score"], d["dist"]))
+
+    best = pool[0]
+    tag = "ACCEPTED" if best["accepted"] else "CANDIDATE (no strict edge)"
+    print(">>> Image retenue [{}] (critère: {}):".format(tag, select_by))
+    print(f"    {best['full']}")
+    print(f"    x={best['x']}  d={best['dist']}px  z={best['z']:.2f}  S={best['S']:.2f}  W={best['W']:.3f}  C={best['C']:.2f}  score={best['score']:.2f}")
+    if save_overlays:
+        print(f"Overlays : {overlay_root}/")
+    return 0
+
+
+# ---------- CLI ----------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Détecter le rebord par vote de colonnes (contraste global + filtres).")
+    # Où chercher
+    ap.add_argument("--folder", default=os.path.join(os.getcwd(), "images_test", "contrasteflou"),
+                    help="Dossier racine des images")
+    ap.add_argument("--pattern", default="*.png", help="Patron d’images (ex: *.png)")
+    ap.add_argument("--no-overlays", action="store_true", help="Ne pas écrire les overlays")
+    ap.add_argument("--select-by", choices=["score","center","z","consensus"], default="score",
+                    help="Critère de sélection finale inter-images")
+
+    # Réglages utiles
+    ap.add_argument("--smooth-profile", type=int, default=SMOOTH_PROFILE, help="Taille lissage profil 1D")
+    ap.add_argument("--polarity", choices=["rising","falling","any"], default=EDGE_POLARITY, help="Polarité du bord")
+    ap.add_argument("--xwin", nargs=2, type=float, default=list(X_WINDOW_FRAC), help="Fenêtre [x0 x1] (fraction 0..1)")
+    ap.add_argument("--no-center-prior", action="store_true", help="Désactiver le prior centré")
+    ap.add_argument("--clahe", action="store_true", help="Activer CLAHE (égalité locale)")
+    ap.add_argument("--no-clahe", action="store_true", help="Désactiver CLAHE")
+
+    # Vote par fenêtres & filtres
+    ap.add_argument("--box-win-frac", type=float, default=BOX_WIN_FRAC, help="Largeur boîte L/R (fraction de W)")
+    ap.add_argument("--box-gap-frac", type=float, default=BOX_GAP_FRAC, help="Gap entre boîtes (fraction de W)")
+    ap.add_argument("--consensus-min", type=float, default=CONSENSUS_MIN, help="Consensus minimal (0..1)")
+    ap.add_argument("--consensus-pow", type=float, default=CONSENSUS_POW, help="Puissance du consensus dans le score")
+    ap.add_argument("--min-step-snr", type=float, default=MIN_STEP_SNR, help="SNR min du saut")
+    ap.add_argument("--max-fwhm-frac", type=float, default=MAX_FWHM_FRAC, help="FWHM max (fraction de W)")
+
+    args = ap.parse_args()
+
+    # Appliquer options
+    SMOOTH_PROFILE = args.smooth_profile
+    EDGE_POLARITY = args.polarity
+    X_WINDOW_FRAC = (args.xwin[0], args.xwin[1])
+    USE_CENTER_PRIOR = not args.no_center_prior
+    USE_CLAHE = False if args.no_clahe else (True if args.clahe or USE_CLAHE else False)
+
+    BOX_WIN_FRAC  = args.box_win_frac
+    BOX_GAP_FRAC  = args.box_gap_frac
+    CONSENSUS_MIN = args.consensus_min
+    CONSENSUS_POW = args.consensus_pow
+    MIN_STEP_SNR  = args.min_step_snr
+    MAX_FWHM_FRAC = args.max_fwhm_frac
+
+    raise SystemExit(main(args.folder, pattern=args.pattern, save_overlays=not args.no_overlays, select_by=args.select_by))
+
+
+
+
+
+
+
