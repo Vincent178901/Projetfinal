@@ -1,0 +1,306 @@
+# Algos/Delimitation_courbe_to_circle_scaled.py
+# Courbe lisse -> cercle virtuel, puis rendu sur une image séparée avec ÉCHELLE RÉDUITE.
+# + Ajouts: point rouge à mi-hauteur sur la courbure et distance centre↔point sur le cercle.
+
+from pathlib import Path
+import argparse
+import numpy as np
+import cv2
+
+# --- Utils ajoutés ---
+def midpoint_on_curve(model, img_h):
+    """Point à mi-hauteur de l'image sur la courbe x(y)=ay^2+by+c."""
+    a, b, c = model
+    y = (img_h - 1) / 2.0
+    x = a * y * y + b * y + c
+    return float(x), float(y)
+
+def clamp_point_to_image(x, y, w, h):
+    """Clippe un point dans [0,w-1]x[0,h-1] et renvoie des entiers."""
+    xi = int(round(min(max(x, 0), w - 1)))
+    yi = int(round(min(max(y, 0), h - 1)))
+    return xi, yi
+
+# --- Convert-to-Mask (type Fiji) ---
+def convert_to_mask(gray, thresh=None, invert=False, close_kernel=5):
+    if thresh is None:
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        _, bw = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY)
+    if invert:
+        bw = 255 - bw
+    if close_kernel < 3:
+        close_kernel = 3
+    # s'assurer impair pour la médiane; sinon OpenCV s'en fiche mais on reste clean
+    if close_kernel % 2 == 0:
+        close_kernel += 1
+    bw = cv2.medianBlur(bw, 5)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((close_kernel, close_kernel), np.uint8))
+    return bw
+
+# --- Frontière (transition 0->1 par ligne) ---
+def extract_boundary_points(bw, prefer_left=True):
+    h, w = bw.shape
+    B = (bw > 0).astype(np.uint8)
+    pts = []
+    for y in range(h):
+        row = B[y, :]
+        trans = np.flatnonzero((row[1:] == 1) & (row[:-1] == 0))
+        if trans.size == 0:
+            continue
+        x = int(trans[0]) + 1 if prefer_left else int(trans[-1]) + 1
+        pts.append([x, y])
+    if not pts:
+        raise RuntimeError("Aucune frontière détectée. Ajuste seuil/inversion.")
+    return np.array(pts, dtype=np.float64)
+
+# --- Quadratique x(y) = a y^2 + b y + c (LS + RANSAC) ---
+def fit_quadratic_ls(pts):
+    y = pts[:,1]; x = pts[:,0]
+    A = np.column_stack([y*y, y, np.ones_like(y)])
+    return tuple(np.linalg.lstsq(A, x, rcond=None)[0])  # (a,b,c)
+
+def ransac_quadratic(pts, iters=400, tol=2.5, min_inliers_ratio=0.5):
+    n = len(pts)
+    if n < 6:
+        return fit_quadratic_ls(pts), np.arange(n)
+    rng = np.random.default_rng(0)
+    best = None; best_inl = None
+    for _ in range(iters):
+        idx = rng.choice(n, size=3, replace=False)
+        a,b,c = fit_quadratic_ls(pts[idx])
+        y = pts[:,1]; err = np.abs(pts[:,0] - (a*y*y + b*y + c))
+        inl = np.where(err < tol)[0]
+        if best_inl is None or len(inl) > len(best_inl):
+            best = (a,b,c); best_inl = inl
+    if best_inl is None or len(best_inl) < max(int(min_inliers_ratio*n), 6):
+        return fit_quadratic_ls(pts), np.arange(n)
+    return fit_quadratic_ls(pts[best_inl]), best_inl
+
+# --- Cercle: Taubin + raffinement; fallback par cercle osculateur local ---
+def fit_circle_taubin(pts):
+    x = pts[:,0].astype(np.float64); y = pts[:,1].astype(np.float64)
+    xm, ym = x.mean(), y.mean()
+    u, v = x - xm, y - ym
+    Suu, Svv, Suv = (u*u).sum(), (v*v).sum(), (u*v).sum()
+    Suuu, Svvv = (u*u*u).sum(), (v*v*v).sum()
+    Suvv, Svuu = (u*v*v).sum(), (v*u*u).sum()
+    A = np.array([[Suu, Suv], [Suv, Svv]], dtype=np.float64)
+    b = 0.5*np.array([Suuu + Suvv, Svvv + Svuu], dtype=np.float64)
+    if abs(np.linalg.det(A)) < 1e-12:
+        return np.nan, np.nan, np.nan
+    sol = np.linalg.lstsq(A, b, rcond=None)[0]
+    uc, vc = sol[0], sol[1]
+    cx, cy = xm + uc, ym + vc
+    r = np.sqrt(max(uc*uc + vc*vc + (Suu + Svv)/len(pts), 0.0))
+    return cx, cy, r
+
+def refine_circle_geometric(pts, cx, cy, r, iters=12):
+    P = pts.astype(np.float64)
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r)):
+        return cx, cy, r
+    for _ in range(iters):
+        dx, dy = P[:,0]-cx, P[:,1]-cy
+        d = np.sqrt(dx*dx + dy*dy) + 1e-9
+        J = np.column_stack([-(dx/d), -(dy/d), -np.ones_like(d)])
+        resid = d - r
+        step, *_ = np.linalg.lstsq(J, resid, rcond=None)
+        cx += step[0]; cy += step[1]; r += step[2]
+    return cx, cy, r
+
+def osculating_circle_from_quad(model, y0):
+    """Cercle osculateur au point (x(y0), y0) pour x(y)=ay^2+by+c."""
+    a,b,c = model
+    x0 = a*y0*y0 + b*y0 + c
+    x1 = 2*a*y0 + b
+    x2 = 2*a
+    # courbure k = |x''| / (1 + x'^2)^(3/2)
+    denom = (1.0 + x1*x1)**1.5
+    if denom < 1e-12 or abs(x2) < 1e-12:
+        return np.nan, np.nan, np.nan
+    k = abs(x2) / denom
+    R = 1.0 / k
+    # normale orientée "vers la gauche" (zone noire), approx:
+    nx = -1.0 / np.sqrt(1.0 + x1*x1)
+    ny =  x1  / np.sqrt(1.0 + x1*x1)
+    sgn = -np.sign(a) if a != 0 else 1.0
+    Cx = x0 + sgn * R * nx
+    Cy = y0 + sgn * R * ny
+    return Cx, Cy, R
+
+# --- Rendus ---
+def draw_curve_overlay(gray, model, out_path, color=(0,165,255), thickness=3, mid_pt=None):
+    a,b,c = model
+    h, w = gray.shape
+    ys = np.arange(0, h, 1, dtype=np.float64)
+    xs = (a*ys*ys + b*ys + c)
+    xs = np.clip(xs, 0, w-1).astype(int)
+    poly = np.stack([xs, ys.astype(int)], axis=1)
+    vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    cv2.polylines(vis, [poly], isClosed=False, color=color, thickness=thickness)
+
+    # --- AJOUT: point rouge à mi-hauteur ---
+    if mid_pt is not None:
+        mx, my = mid_pt
+        mx_i, my_i = clamp_point_to_image(mx, my, w, h)
+        cv2.circle(vis, (mx_i, my_i), 6, (0,0,255), -1, lineType=cv2.LINE_AA)
+
+    cv2.imwrite(str(out_path), vis)
+    return poly
+
+def draw_circle_scaled(circle, ref_poly, target_radius=300, margin=60, show_arc=True, out_path="virtual_circle.png",
+                       mid_pt=None, dist_px=None):
+    """Affiche le cercle à échelle réduite: rayon affiché=target_radius px.
+       On rescale et translate pour mettre le centre au milieu du canevas.
+       Si mid_pt est fourni (coords dans l'image d'origine), on le projette et
+       on affiche la distance au centre (dist_px)."""
+    cx, cy, r = circle
+    H = W = 2*target_radius + 2*margin
+    canvas = np.full((H, W, 3), 255, np.uint8)
+
+    if not (np.isfinite(r) and r > 0):
+        cv2.putText(canvas, "Cercle non stable (rayon invalide)", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2, cv2.LINE_AA)
+        cv2.imwrite(str(out_path), canvas)
+        return out_path
+
+    # échelle pour ramener r -> target_radius
+    s = float(target_radius) / float(r)
+    cx_disp = margin + target_radius
+    cy_disp = margin + target_radius
+
+    # cercle + centre
+    cv2.circle(canvas, (int(round(cx_disp)), int(round(cy_disp))), int(round(target_radius)), (255,0,0), 2)
+    cv2.circle(canvas, (int(round(cx_disp)), int(round(cy_disp))), 3, (0,0,255), -1)
+
+    # (optionnel) l'arc mesuré, rescalé pour vérifier l'alignement
+    if show_arc and ref_poly is not None and len(ref_poly) > 1:
+        ref_poly = np.asarray(ref_poly, dtype=np.float64)
+        Xs = s*(ref_poly[:,0] - cx) + cx_disp
+        Ys = s*(ref_poly[:,1] - cy) + cy_disp
+        pts = np.stack([Xs, Ys], axis=1).round().astype(int)
+        # clip
+        m = (pts[:,0]>=0)&(pts[:,0]<W)&(pts[:,1]>=0)&(pts[:,1]<H)
+        pts = pts[m]
+        if len(pts) >= 2:
+            cv2.polylines(canvas, [pts], isClosed=False, color=(0,165,255), thickness=2)
+
+    # --- AJOUT: projeter le point rouge + distance ---
+    if mid_pt is not None:
+        mx, my = float(mid_pt[0]), float(mid_pt[1])
+        mx_disp = int(round(s*(mx - cx) + cx_disp))
+        my_disp = int(round(s*(my - cy) + cy_disp))
+        # point rouge
+        cv2.circle(canvas, (mx_disp, my_disp), 6, (0,0,255), -1, lineType=cv2.LINE_AA)
+        # segment centre->point
+        cv2.line(canvas, (int(round(cx_disp)), int(round(cy_disp))), (mx_disp, my_disp), (0,0,0), 2, lineType=cv2.LINE_AA)
+        # texte distance (si non fourni, on le calcule ici pour robustesse)
+        if dist_px is None:
+            dist_px = float(np.hypot(mx - cx, my - cy))
+        label = f"{dist_px:.2f} px"
+        # positionner le texte vers le milieu du segment, avec petit offset
+        tx = int(round((mx_disp + cx_disp) / 2)) + 8
+        ty = int(round((my_disp + cy_disp) / 2)) - 8
+        cv2.putText(canvas, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2, cv2.LINE_AA)
+
+    cv2.imwrite(str(out_path), canvas)
+    return out_path
+
+# --- Pipeline principal ---
+def process(image_path, thresh=None, invert=False, prefer_left=True,
+            close_kernel=5, iters=400, tol=2.5, minratio=0.5,
+            target_radius=300, margin=60, show_arc=True, thickness=3):
+    gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+
+    # 1) Convert-to-Mask (interne)
+    bw = convert_to_mask(gray, thresh=thresh, invert=invert, close_kernel=close_kernel)
+
+    # 2) Points de frontière -> quadratique robuste
+    pts = extract_boundary_points(bw, prefer_left=prefer_left)
+    model, inl = ransac_quadratic(pts, iters=iters, tol=tol, min_inliers_ratio=minratio)
+
+    # --- AJOUT: point rouge à mi-hauteur (coords image d'origine) ---
+    mx, my = midpoint_on_curve(model, img_h=gray.shape[0])
+
+    # 3) Overlay courbe sur l'image source (diagnostic) + point rouge
+    out_curve = Path(image_path).with_name(Path(image_path).stem + "_curve.png")
+    poly = draw_curve_overlay(gray, model, out_curve, thickness=thickness, mid_pt=(mx, my))
+
+    # 4) Cercle à partir de la courbe lisse
+    poly_f = poly.astype(np.float64)
+    cx, cy, r = fit_circle_taubin(poly_f)
+    cx, cy, r = refine_circle_geometric(poly_f, cx, cy, r, iters=12)
+
+    # 4b) Fallback: cercle osculateur local si r est NaN/inf
+    if not (np.isfinite(r) and r > 0):
+        y0 = gray.shape[0]/2.0
+        Cx, Cy, R = osculating_circle_from_quad(model, y0)
+        cx, cy, r = Cx, Cy, R
+
+    # --- AJOUT: distance centre↔point (en pixels d'origine)
+    dist_px = float(np.hypot(mx - cx, my - cy))
+
+    # 5) Rendu ÉCHELLE RÉDUITE du cercle (plus toujours visible même si r est énorme)
+    out_circle = Path(image_path).with_name(Path(image_path).stem + "_virtual_circle_scaled.png")
+    draw_circle_scaled((cx, cy, r), poly, target_radius=target_radius, margin=margin,
+                       show_arc=show_arc, out_path=str(out_circle),
+                       mid_pt=(mx, my), dist_px=dist_px)
+
+    return str(out_curve), str(out_circle)
+
+# --- CLI ---
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Courbe lisse -> Cercle virtuel, rendu à échelle réduite.")
+    p.add_argument("--img", type=str, default=None, help="Chemin image (relatif/absolu).")
+    p.add_argument("--thresh", type=int, default=None, help="Seuil manuel; Otsu si omis.")
+    p.add_argument("--invert", action="store_true", help="Inverser le masque si nécessaire.")
+    p.add_argument("--prefer-right", action="store_true", help="Frontière la plus à droite (défaut: gauche).")
+    p.add_argument("--close-kernel", type=int, default=5)
+    p.add_argument("--iters", type=int, default=400)
+    p.add_argument("--tol", type=float, default=2.5)
+    p.add_argument("--minratio", type=float, default=0.5)
+    p.add_argument("--thickness", type=int, default=3)
+    p.add_argument("--target-radius", type=int, default=300, help="Rayon affiché du cercle (px) sur l’image de sortie.")
+    p.add_argument("--margin", type=int, default=60, help="Marge autour du cercle sur l’image de sortie (px).")
+    p.add_argument("--no-arc", action="store_true", help="Ne pas dessiner l’arc rescalé sur le canevas du cercle.")
+    args = p.parse_args()
+
+    root = Path(__file__).resolve().parents[1]
+    if args.img:
+        img_path = (root / args.img) if not Path(args.img).is_absolute() else Path(args.img)
+        if not img_path.exists():
+            raise SystemExit(f"Image introuvable: {img_path}")
+    else:
+        cands = list((root / "images_test").rglob("*13.18.26.png"))
+        if not cands:
+            raise SystemExit("'*13.18.26.png' introuvable sous images_test/")
+        img_path = cands[0]
+
+    out_curve, out_circle = process(
+        img_path,
+        thresh=args.thresh,
+        invert=args.invert,
+        prefer_left=not args.prefer_right,
+        close_kernel=args.close_kernel,
+        iters=args.iters,
+        tol=args.tol,
+        minratio=args.minratio,
+        target_radius=args.target_radius,
+        margin=args.margin,
+        show_arc=not args.no_arc,
+        thickness=args.thickness,
+    )
+    print(f"Courbe superposée : {out_curve}")
+    print(f"Cercle virtuel (échelle réduite) : {out_circle}")
+
+
+
+
+
+
+
+
+
+
+
+
