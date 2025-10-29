@@ -1,0 +1,35 @@
+# final_edges_only.py
+import cv2, numpy as np
+from pathlib import Path
+
+BASE_DIR = Path("images_test") / "Tests"
+IMG = BASE_DIR / "Test_localisation cercle_6.png"  # ← change si besoin
+
+img = cv2.imread(str(IMG), cv2.IMREAD_COLOR)
+if img is None:
+    raise FileNotFoundError(IMG)
+
+# 1) Bilatéral fort sur la luminance (3 passes)
+ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+y, cr, cb = cv2.split(ycc)
+for _ in range(3):
+    y = cv2.bilateralFilter(y, d=21, sigmaColor=240, sigmaSpace=240)
+img_bilat = cv2.cvtColor(cv2.merge([y, cr, cb]), cv2.COLOR_YCrCb2BGR)
+
+# 2) Dérivée (Scharr) + norme du gradient
+gray = cv2.cvtColor(img_bilat, cv2.COLOR_BGR2GRAY)
+gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+mag = cv2.magnitude(gx, gy)
+final = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+# 3) Sauvegarde UNIQUE (sortie finale)
+out_path = IMG.with_name(IMG.stem + "_final_edges.png")
+cv2.imwrite(str(out_path), final)
+print(f"Sortie finale : {out_path}")
+
+
+
+
+
+

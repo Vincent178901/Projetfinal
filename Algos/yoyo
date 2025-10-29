@@ -1,0 +1,497 @@
+# -*- coding: utf-8 -*-
+"""
+Vidéo -> Score vs temps (1 Hz), overlay du MEILLEUR SCORE global
+-----------------------------------------------------------------
+- Prétraitement: CLAHE + unsharp
+- Scharr multi-échelle (normalisation d’échelle)
+- RANSAC (+ fallback Hough) pour la droite dominante
+- Mesures:
+    * Contraste local (bande étroite autour de la ligne, percentiles)  -> favorise saut RAIDE
+    * Alignement des orientations (concentration)
+    * Contraste GLOBAL SANS LIGNE (percentiles de magnitude)           -> favorise saut RAIDE global
+- SCORE = 0.6*Contraste_local + 0.2*(50*Concentration) + 0.2*(Contraste_global_score)
+- Sorties:
+    - <video>_best_score_overlay.png (frame au score MAX)
+    - <video>_score_plot.png (Score, Contraste_local, Contraste_global, Concentration)
+"""
+
+from pathlib import Path
+import argparse, math, warnings
+import numpy as np
+import cv2
+
+# Matplotlib en mode headless
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Réduction des warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+np.seterr(divide='ignore', invalid='ignore', over='ignore')
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+# ======= CONFIG PAR DÉFAUT =======
+VIDEO_PATH_DEFAULT = "/Users/vincentlelievre/Desktop/video1balayagehorsfocale.avi"
+OUT_DIR_DEFAULT    = "out_best"
+
+# ---------------- utilitaires ----------------
+def ensure_outdir(p: Path): p.mkdir(parents=True, exist_ok=True)
+def to_gray(img): return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+
+def variance_of_laplacian(gray):
+    g8 = np.clip(gray, 0, 255).astype(np.uint8)
+    try:
+        return float(cv2.Laplacian(g8, cv2.CV_64F, ksize=3).var())
+    except cv2.error:
+        pass
+    try:
+        lap16 = cv2.Laplacian(g8, cv2.CV_16S, ksize=3)
+        return float(lap16.astype(np.float32).var())
+    except cv2.error:
+        pass
+    sx = cv2.Sobel(g8, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(g8, cv2.CV_32F, 0, 1, ksize=3)
+    return float((sx*sx + sy*sy).mean())
+
+def adapt_params_for_blur(gray, base_band_px=6, imgdiag=None):
+    vl = variance_of_laplacian(gray)
+    if vl < 8:
+        scales = [2.0, 4.0, 6.0, 8.0]; mag_pct = 60.0; ang_tol = 16.0; inlier_thr = 4.0; gamma = 1.2
+    elif vl < 20:
+        scales = [1.2, 2.4, 3.6, 5.0]; mag_pct = 70.0; ang_tol = 14.0; inlier_thr = 3.0; gamma = 1.1
+    elif vl < 50:
+        scales = [0.8, 1.6, 3.0, 4.5]; mag_pct = 75.0; ang_tol = 12.0; inlier_thr = 2.5; gamma = 1.0
+    else:
+        scales = [0.8, 1.6, 2.4];     mag_pct = 80.0; ang_tol = 10.0; inlier_thr = 2.0; gamma = 1.0
+    if imgdiag is None: imgdiag = float(np.hypot(*gray.shape))
+    band = int(max(base_band_px, 0.01 * imgdiag))
+    if vl < 15: band = int(1.6 * band)
+    if vl < 8:  band = int(2.0 * band)
+    contrast_min = max(4.0, 0.25 * float(gray.std()))
+    gap = max(3, band // 3)
+    return dict(scales=scales, mag_pct=mag_pct, ang_tol=ang_tol,
+                inlier_thr=inlier_thr, band=band, gap=gap, gamma=gamma,
+                contrast_min=contrast_min, vol=vl)
+
+# ---- Scharr multi-échelle ----
+def scharr_mag_angle(gray_f32):
+    gx = cv2.Scharr(gray_f32, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray_f32, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    ang = (np.arctan2(gy, gx) + np.pi) % np.pi
+    return mag, ang
+
+def grad_scale_space(gray, sigmas, gamma=1.0):
+    mags, angs = [], []
+    for s in sigmas:
+        gs = cv2.GaussianBlur(gray, (0,0), sigmaX=max(0.4, s))
+        mag, ang = scharr_mag_angle(gs)
+        if gamma != 0.0: mag *= (s ** float(gamma))
+        mags.append(mag); angs.append(ang)
+    stack = np.stack(mags, axis=-1)
+    idx = stack.argmax(axis=-1)
+    mag_max = stack.max(axis=-1)
+    ang_pick = np.zeros_like(mag_max, np.float32)
+    for k in range(len(sigmas)):
+        m = (idx==k)
+        if np.any(m): ang_pick[m] = angs[k][m]
+    return mag_max, ang_pick
+
+# ---- orientation & sélection ----
+def dominant_orientation_weighted(ang, mag, bins=90, mag_thresh_pct=90.0):
+    t = np.percentile(mag, mag_thresh_pct)
+    w = mag.copy(); w[w < t] = 0.0
+    hist, edges = np.histogram(ang.flatten(), bins=bins, range=(0, np.pi), weights=w.flatten())
+    b = int(np.argmax(hist))
+    return 0.5*(edges[b] + edges[b+1]), hist
+
+def select_edge_points(ang, mag, theta, tol_deg=10.0, mag_pct=80.0, max_pts=40000):
+    t = np.percentile(mag, mag_pct)
+    ok_mag = mag >= t
+    d = np.abs(((ang - theta + np.pi/2) % np.pi) - np.pi/2)
+    ok_ang = d <= np.deg2rad(tol_deg)
+    ys, xs = np.where(ok_mag & ok_ang)
+    if xs.size == 0: return np.empty((0,2), np.float32)
+    if xs.size > max_pts:
+        idx = np.random.choice(xs.size, max_pts, replace=False); xs, ys = xs[idx], ys[idx]
+    return np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+
+# ---- ajustement de ligne ----
+def ransac_line(pts, iters=2000, inlier_thresh=2.5):
+    if len(pts) < 50: return None, np.array([], int)
+    best_in, best_model = [], None
+    for _ in range(iters):
+        i = np.random.choice(len(pts), 2, replace=False)
+        p1, p2 = pts[i[0]], pts[i[1]]
+        v = p2 - p1
+        if np.linalg.norm(v) < 1e-6: continue
+        a, b = v[1], -v[0]; c = -(a*p1[0] + b*p1[1])
+        den = math.hypot(a,b) + 1e-9
+        d = np.abs((a*pts[:,0] + b*pts[:,1] + c)/den)
+        in_idx = np.where(d <= inlier_thresh)[0]
+        if in_idx.size > len(best_in):
+            best_in, best_model = in_idx, (a,b,c)
+    if best_model is None: return None, np.array([], int)
+    P = pts[best_in]; x, y = P[:,0], P[:,1]
+    A = np.column_stack([x, np.ones_like(x)])
+    m, q = np.linalg.lstsq(A, y, rcond=None)[0]
+    return (m, -1.0, q), best_in
+
+def line_fallback_hough(gray_u8):
+    e = cv2.Canny(gray_u8, 20, 60, L2gradient=True)
+    lines = cv2.HoughLinesP(e, 1, np.pi/180, threshold=60,
+                            minLineLength=int(0.25*max(gray_u8.shape)), maxLineGap=10)
+    if lines is None: return None
+    x1,y1,x2,y2 = max(lines[:,0,:], key=lambda L: (L[2]-L[0])**2 + (L[3]-L[1])**2)
+    if x2 == x1: return (1.0, 0.0, -x1)
+    m = (y2 - y1) / (x2 - x1 + 1e-9)
+    return (m, -1.0, y1 - m*x1)
+
+def line_direction(a,b):
+    v = np.array([b, -a], dtype=np.float32)
+    v /= (np.linalg.norm(v) + 1e-9)
+    return v
+
+# ---- CONTRASTE LOCAL (bande étroite, robustifié percentiles) ----
+def bilateral_contrast_local(gray, a,b,c, band_narrow=8, gap=3, p_low=10, p_high=90):
+    h,w = gray.shape
+    Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
+    den = (math.hypot(a,b)+1e-9)
+    dist = (a*X + b*Y + c) / den
+    left_mask  = (dist <= -gap) & (np.abs(dist) <= band_narrow)
+    right_mask = (dist >=  gap) & (np.abs(dist) <= band_narrow)
+    nL, nR = int(left_mask.sum()), int(right_mask.sum())
+    if nL < 80 or nR < 80: return 0.0, nL+nR
+    L = gray[left_mask].astype(np.float32)
+    R = gray[right_mask].astype(np.float32)
+    lQ = np.percentile(L, p_high); rq = np.percentile(R, p_low)
+    return float(abs(lQ - rq)), nL+nR
+
+def refine_line_offset_for_max_contrast(gray, a,b,c, band_narrow=8, gap=3, search_px=10):
+    best_c, best_contr = c, -1.0
+    step = max(1, int(search_px))
+    for d in range(-step, step+1):
+        c_try = c + d * math.hypot(a,b)
+        contr, _ = bilateral_contrast_local(gray, a,b,c_try, band_narrow=band_narrow, gap=gap)
+        if contr > best_contr:
+            best_contr, best_c = contr, c_try
+    return best_c, best_contr
+
+def orientation_concentration_weighted(ang, mag, mag_thresh_pct=90.0, bins=90):
+    """
+    Alignement d’orientations (plus c'est aligné, plus ça monte).
+    - garde les magnitudes au-dessus d’un percentile élevé
+    - histogramme pondéré par la magnitude
+    - retourne 1/(entropie+ε)
+    """
+    t = np.percentile(mag, mag_thresh_pct)
+    w = np.where(mag >= t, mag, 0.0).astype(np.float32)
+    hist, _ = np.histogram(ang.flatten(), bins=bins, range=(0, np.pi), weights=w.flatten())
+    p = hist / (hist.sum() + 1e-9)
+    ent = -np.sum(p * np.log(p + 1e-12))
+    return float(1.0 / (ent + 1e-6))
+
+# ---- CONTRASTE GLOBAL SANS LIGNE (favorise saut très raide) ----
+def global_sharp_contrast(mag, p_hi=99.5, p_mid=90.0, p_lo=50.0):
+    """
+    Mesure de 'raideur' globale indépendante de la ligne.
+    score = 10 * ( (p_hi - p_mid) / (p_mid - p_lo + eps) )
+    - grand si la queue haute (p_hi) dépasse nettement le bulk (p_mid),
+      donc bord étroit/raide ; pénalise les halos larges.
+    """
+    hi  = float(np.percentile(mag, p_hi))
+    mid = float(np.percentile(mag, p_mid))
+    lo  = float(np.percentile(mag, p_lo))
+    slope = (hi - mid) / (max(1e-6, (mid - lo)))
+    return float(max(0.0, 10.0 * slope))
+
+# ---- Poids du score ----
+w_contrast = 0.6     # contraste local (le long de la ligne)
+w_orient   = 0.2     # concentration d'orientations (×50 à l'affichage)
+w_global   = 0.2     # contraste global sans ligne
+
+# ---- frame -> score ----
+def process_frame(bgr, scales_cli, bins, preview,
+                  ang_tol_cli, mag_pct_cli, inlier_thr_cli,
+                  span_frac, contrast_min_cli, band_cli, gap_cli, gamma_cli):
+    if bgr is None:
+        return dict(ok=False, score=0.0, contrast=0.0, conc=0.0, gcontr=0.0, overlay=None)
+
+    # Resize + prétraitement
+    h,w = bgr.shape[:2]
+    s = min(1.0, float(preview)/max(h,w))
+    if s < 1.0:
+        bgr = cv2.resize(bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+    gray0 = to_gray(bgr)
+
+    g8 = np.clip(gray0, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g8 = clahe.apply(g8)
+    g_blur = cv2.GaussianBlur(g8, (0,0), 1.2)
+    g_sharp = cv2.addWeighted(g8, 1.0, g_blur, -0.6, 0)
+    gray = g_sharp.astype(np.float32)
+
+    # Adaptation
+    H,W = gray.shape
+    adaptive = adapt_params_for_blur(gray, base_band_px=max(6, band_cli), imgdiag=np.hypot(H,W))
+    scales     = scales_cli if scales_cli is not None else adaptive['scales']
+    mag_pct    = mag_pct_cli if mag_pct_cli and mag_pct_cli>0 else adaptive['mag_pct']
+    ang_tol    = ang_tol_cli if ang_tol_cli and ang_tol_cli>0 else adaptive['ang_tol']
+    inlier_thr = inlier_thr_cli if inlier_thr_cli and inlier_thr_cli>0 else adaptive['inlier_thr']
+    band       = band_cli if band_cli and band_cli>0 else adaptive['band']
+    gap        = gap_cli  if gap_cli  and gap_cli>0  else adaptive['gap']
+    gamma      = gamma_cli if gamma_cli is not None else adaptive['gamma']
+    contrast_min = contrast_min_cli if contrast_min_cli and contrast_min_cli>0 else adaptive['contrast_min']
+
+    # Gradient + orientation
+    mag, ang = grad_scale_space(gray, scales, gamma=gamma)
+    # Contraste GLOBAL (sans ligne)
+    global_contr_score = global_sharp_contrast(mag)
+
+    theta, _ = dominant_orientation_weighted(ang, mag, bins=bins, mag_thresh_pct=max(85.0, mag_pct))
+    pts = select_edge_points(ang, mag, theta, tol_deg=ang_tol, mag_pct=mag_pct)
+    model, in_idx = ransac_line(pts, iters=2000, inlier_thresh=inlier_thr)
+
+    if model is None or in_idx.size < 50:
+        fb = line_fallback_hough(np.clip(gray,0,255).astype(np.uint8))
+        if fb is not None:
+            model = fb
+            in_idx = np.arange(len(pts))
+        else:
+            overlay = cv2.cvtColor(np.clip((mag/(np.percentile(mag,98)+1e-6))*255,0,255).astype(np.uint8),
+                                   cv2.COLOR_GRAY2BGR)
+            cv2.putText(overlay, "EDGE=NO (RANSAC/Hough fail)", (10,28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+            return dict(ok=False, score=float(w_global*global_contr_score),
+                        contrast=0.0, conc=0.0, gcontr=float(global_contr_score), overlay=overlay)
+
+    a,b,c = model
+    # Recentrage de la ligne pour maximiser le contraste local raide
+    c, _ = refine_line_offset_for_max_contrast(
+        gray, a,b,c, band_narrow=max(6, band//2), gap=max(2, gap), search_px=10
+    )
+
+    # Portée le long de la ligne
+    v = line_direction(a,b)
+    if in_idx.size >= 2 and len(pts)>0:
+        P = pts[in_idx]
+        proj = (P @ v.reshape(2,1)).flatten()
+        span = float(proj.max() - proj.min()) if proj.size else 0.0
+    else:
+        span = float(max(H,W)*0.5)
+    span_needed = span_frac * max(H,W)
+
+    # Mesures locales & alignement
+    contrast_local, _ = bilateral_contrast_local(
+        gray, a,b,c, band_narrow=max(6, band//2), gap=max(2, gap), p_low=10, p_high=90
+    )
+    conc = orientation_concentration_weighted(
+    ang, mag, mag_thresh_pct=max(85.0, mag_pct), bins=bins)
+
+    ok = (span >= span_needed) and (contrast_local >= contrast_min)
+
+    # Score composite (global sans ligne inclus)
+    score = (w_contrast*contrast_local) + (w_orient*(conc*50.0)) + (w_global*global_contr_score)
+
+    # Overlay
+    overlay = cv2.cvtColor(np.clip((mag/(np.percentile(mag,98)+1e-6))*255,0,255).astype(np.uint8),
+                           cv2.COLOR_GRAY2BGR)
+    h2,w2 = overlay.shape[:2]
+    def inter(x=None,y=None):
+        if x is not None:
+            if abs(b) < 1e-6: return None
+            yy = -(a*x + c)/b
+            if 0 <= yy < h2: return (int(x), int(round(yy)))
+        if y is not None:
+            if abs(a) < 1e-6: return None
+            xx = -(b*y + c)/a
+            if 0 <= xx < w2: return (int(round(xx)), int(y))
+        return None
+    pts_line=[]
+    for x in [0, w2-1]:
+        p = inter(x=x); 
+        if p is not None: pts_line.append(p)
+    for y in [0, h2-1]:
+        p = inter(y=y); 
+        if p is not None: pts_line.append(p)
+    if len(pts_line) >= 2:
+        cv2.line(overlay, pts_line[0], pts_line[-1], (0,255,0), 2)
+
+    cv2.putText(overlay, f"SCORE={score:.2f}  cLoc={contrast_local:.2f}  cGlob={global_contr_score:.2f}  conc={conc:.2f}  ok={ok}",
+                (10,28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if ok else (0,0,255), 2, cv2.LINE_AA)
+
+    return dict(ok=ok, score=float(score), contrast=float(contrast_local),
+                conc=float(conc), gcontr=float(global_contr_score), overlay=overlay)
+
+# ---------------- boucle vidéo + PLOT ----------------
+def parse_scales(arg: str):
+    try:
+        vals = [float(x) for x in arg.split(",") if x.strip()!=""]
+        if not vals: raise ValueError
+        return vals
+    except Exception:
+        raise argparse.ArgumentTypeError("Format invalide pour --scales, ex: 0.8,1.6,3.0,4.5")
+
+def run(video_path: Path, out_dir: Path, preview,
+        bins, ang_tol, mag_pct, ransac_thr, span_frac, contrast_min,
+        band, gap, scales_cli, auto_flag, gamma_cli):
+
+    ensure_outdir(out_dir)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise SystemExit(f"Impossible d'ouvrir la vidéo: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps <= 0 or n_frames <= 0:
+        raise SystemExit("FPS ou nombre de frames invalide(s).")
+
+    duration = n_frames / fps
+    step = 1.0
+    print(f"[INFO] vidéo: {video_path.name} | {duration:.2f}s, {n_frames} frames @ {fps:.2f} fps")
+    print(f"[INFO] échantillonnage: 1 frame / 1.00s (à t exact)")
+
+    out_png_overlay = out_dir / f"{video_path.stem}_best_score_overlay.png"
+    out_png_plot    = out_dir / f"{video_path.stem}_score_plot.png"
+
+    ts, scores, c_loc, c_glob, concs = [], [], [], [], []
+    best_score, best_overlay, best_t, best_idx = -1.0, None, None, None
+
+    t = 0.0
+    while t <= duration + 1e-6:
+        t_samp = min(t, duration - 1e-6)
+        idx = int(round(t_samp * fps))
+        idx = min(max(idx, 0), n_frames - 1)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok_read, bgr = cap.read()
+        if not ok_read or bgr is None:
+            t += step
+            continue
+
+        res = process_frame(
+            bgr=bgr,
+            scales_cli=(scales_cli if not auto_flag else None),
+            bins=bins,
+            preview=preview,
+            ang_tol_cli=(ang_tol if ang_tol>0 else None),
+            mag_pct_cli=(mag_pct if mag_pct>0 else None),
+            inlier_thr_cli=(ransac_thr if ransac_thr>0 else None),
+            span_frac=span_frac,
+            contrast_min_cli=contrast_min,
+            band_cli=band, gap_cli=gap, gamma_cli=gamma_cli
+        )
+
+        ts.append(t_samp)
+        scores.append(res['score'])
+        c_loc.append(res['contrast'])
+        c_glob.append(res['gcontr'])
+        concs.append(res['conc'])
+
+        print(f"  t={t_samp:6.2f}s | frame {idx:6d} | score={res['score']:6.2f} | ok={res['ok']}")
+
+        if res['score'] > best_score:
+            best_score, best_overlay, best_t, best_idx = res['score'], res['overlay'], t_samp, idx
+
+        t += step
+
+    cap.release()
+
+    if best_overlay is not None:
+        cv2.imwrite(str(out_png_overlay), best_overlay)
+        print(f"[OK] Meilleur score: {best_score:.2f} @ t={best_t:.2f}s (frame {best_idx})")
+        print(f"[OUT] Overlay: {out_png_overlay}")
+    else:
+        print("[WARN] Aucun overlay disponible.")
+
+    # Graphique (couleurs fixes, pas d'affichage écran)
+    if ts:
+        fig, ax1 = plt.subplots(figsize=(11,5))
+        L1 = ax1.plot(ts, scores, color='tab:blue',   linewidth=2, label='Score (mixte)')
+        L2 = ax1.plot(ts, c_loc,  color='tab:orange', linewidth=2, label='Contraste local')
+        ax1.set_xlabel('Temps (s)')
+        ax1.set_ylabel('Score / Contraste local')
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = ax1.twinx()
+        L3 = ax2.plot(ts, c_glob, color='tab:green', linewidth=2, label='Contraste global')
+        L4 = ax2.plot(ts, [c*50.0 for c in concs], color='tab:red', linewidth=2, label='Alignement (×50)')
+        ax2.set_ylabel('Contraste global / Alignement×50')
+
+        if best_t is not None:
+            ax1.axvline(best_t, linestyle=':', color='gray', linewidth=1)
+
+        lines = L1 + L2 + L3 + L4
+        labels = [ln.get_label() for ln in lines]
+        ax1.legend(lines, labels, loc='best')
+
+        plt.tight_layout()
+        plt.savefig(str(out_png_plot), dpi=150)
+        print(f"[OUT] Graphique: {out_png_plot}")
+        plt.close()
+    else:
+        print("[WARN] Aucun point échantillonné pour le graphique.")
+
+# ---------------- CLI ----------------
+def parse_scales(arg: str):
+    try:
+        vals = [float(x) for x in arg.split(",") if x.strip()!=""]
+        if not vals: raise ValueError
+        return vals
+    except Exception:
+        raise argparse.ArgumentTypeError("Format invalide pour --scales, ex: 0.8,1.6,3.0,4.5")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v","--video",  default=VIDEO_PATH_DEFAULT, help="Chemin vidéo .avi")
+    ap.add_argument("-o","--out",    default=OUT_DIR_DEFAULT,    help="Dossier de sortie")
+    ap.add_argument("--preview", type=int, default=1200, help="Plus grand côté (px) pour le traitement")
+    ap.add_argument("--bins", type=int, default=90)
+    ap.add_argument("--ang-tol", type=float, default=0.0)
+    ap.add_argument("--mag-pct", type=float, default=0.0)
+    ap.add_argument("--inlier-thr", type=float, default=0.0)
+    ap.add_argument("--span-frac", type=float, default=0.45)
+    ap.add_argument("--contrast-min", type=float, default=0.0)
+    ap.add_argument("--band", type=int, default=6)
+    ap.add_argument("--gap",  type=int, default=0)
+    ap.add_argument("--scales", type=parse_scales, default=None)
+    ap.add_argument("--auto", action="store_true")
+    ap.add_argument("--gamma", type=float, default=None)
+    args = ap.parse_args()
+
+    vp = Path(args.video)
+    if not vp.exists():
+        raise SystemExit(f"Vidéo introuvable: {vp}")
+
+    run(video_path=vp, out_dir=Path(args.out), preview=args.preview,
+        bins=args.bins, ang_tol=args.ang_tol, mag_pct=args.mag_pct, ransac_thr=args.inlier_thr,
+        span_frac=args.span_frac, contrast_min=args.contrast_min, band=args.band, gap=args.gap,
+        scales_cli=args.scales, auto_flag=args.auto, gamma_cli=args.gamma)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

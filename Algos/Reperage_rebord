@@ -1,0 +1,157 @@
+# -*- coding: utf-8 -*-
+"""
+Score vidéo (1 img/s)
+- α : force du contraste latéral (std des moyennes par colonne) **faire moyenne pour les rangées aussi***
+- β : couverture géométrique de ce contraste (entropie normalisée du gradient 1D)
+Sauvegarde dans ../images_test/outputs/ :
+  1) <video>_score.png : courbes Score / α / β
+  2) <video>_alpha_max_t<sec>.png : frame au temps où α est maximal
+"""
+
+from pathlib import Path
+import numpy as np
+import cv2
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ====== PARAMÈTRES ======
+VIDEO_PATH = Path("/Users/vincentlelievre/Desktop/video3procchefocalecentre.avi")  # <- ta vidéo
+ALPHA_WEIGHT = 1.0
+BETA_WEIGHT  = 1.0
+MAX_SECONDS  = None   # None = toute la vidéo
+SHOW_PARTS   = True
+DPI          = 150
+GAUSS_BLUR   = True
+SMOOTH_1D    = True
+
+def smooth1d(x):
+    if not SMOOTH_1D or x.size < 5:
+        return x
+    k = np.array([1,4,6,4,1], dtype=np.float32) / 16.0
+    return np.convolve(x, k, mode="same")
+
+def compute_alpha(gray):
+    # α = écart-type des moyennes par colonne
+    col_means = gray.mean(axis=0).astype(np.float32)
+    col_means = smooth1d(col_means)
+    alpha = float(col_means.std(ddof=0))
+    return alpha, col_means
+
+def compute_beta_from_profile(col_means, eps=1e-12):
+    # β = entropie normalisée de la répartition des variations du profil m(x)
+    if col_means.size < 3:
+        return 0.0
+    g = np.abs(np.diff(col_means))
+    s = float(g.sum())
+    if s <= eps:
+        return 0.0
+    w = g / (s + eps)
+    H = -np.sum(w * np.log(w + eps)) / np.log(len(w) + eps)  # ∈ [0,1]
+    return float(H)
+
+def compute_score(gray):
+    if GAUSS_BLUR:
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    alpha, col_means = compute_alpha(gray)
+    beta  = compute_beta_from_profile(col_means)
+    score = ALPHA_WEIGHT * alpha + BETA_WEIGHT * beta
+    return score, alpha, beta
+
+def main():
+    if not VIDEO_PATH.exists():
+        raise FileNotFoundError(f"Fichier vidéo introuvable: {VIDEO_PATH}")
+
+    cap = cv2.VideoCapture(str(VIDEO_PATH))
+    if not cap.isOpened():
+        raise RuntimeError(f"Impossible d'ouvrir la vidéo: {VIDEO_PATH}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        raise RuntimeError("FPS non valide dans la vidéo.")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_s = total_frames / fps if total_frames > 0 else 0.0
+    if MAX_SECONDS is not None:
+        duration_s = min(duration_s, MAX_SECONDS)
+
+    times, scores, alphas, betas = [], [], [], []
+
+    # --- Tracking du meilleur α ---
+    best_alpha = -1.0
+    best_time_s = 0.0
+    best_frame_bgr = None
+
+    n_seconds = int(np.floor(duration_s))
+    for t in range(n_seconds + 1):
+        frame_idx = int(round(t * fps))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        score, a, b = compute_score(gray)
+
+        times.append(float(t)); scores.append(score); alphas.append(a); betas.append(b)
+
+        # Met à jour le meilleur α
+        if a > best_alpha:
+            best_alpha = a
+            best_time_s = float(t)
+            best_frame_bgr = frame.copy()
+
+    cap.release()
+    if len(times) == 0 or best_frame_bgr is None:
+        raise RuntimeError("Aucune image n'a pu être lue.")
+
+    # --- Dossier de sortie: ../images_test/outputs/ (par rapport au script dans Algos/) ---
+    script_dir = Path(__file__).resolve().parent            # .../Projetfinal/Algos
+    out_dir = script_dir.parent / "images_test" / "outputs" # .../Projetfinal/images_test/outputs
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Sauvegarde du graphique
+    out_png_plot = out_dir / f"{VIDEO_PATH.stem}_score.png"
+    fig = plt.figure(figsize=(9, 4.5))
+    ax = plt.gca()
+    ax.plot(times, scores, marker="o", label="Score total")
+    if SHOW_PARTS:
+        ax.plot(times, alphas, linestyle="--", marker=".", label="α : contraste latéral (force)")
+        ax.plot(times, betas,  linestyle=":",  marker=".", label="β : couverture géométrique")
+    ax.axvline(best_time_s, linestyle="--", alpha=0.5, label=f"α max à t={int(best_time_s)} s")
+    ax.set_xlabel("Temps (s)")
+    ax.set_ylabel("Score / Mesures normalisées")
+    ax.set_title(f"Score vidéo\n{VIDEO_PATH.name} (α={ALPHA_WEIGHT}, β={BETA_WEIGHT})")
+    ax.grid(True, linestyle=":")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    plt.savefig(str(out_png_plot), dpi=DPI)
+    plt.close(fig)
+
+    # 2) Sauvegarde de la frame où α est maximal
+    # (convertit BGR->RGB pour un PNG « normal », ou laisse en BGR pour cv2.imwrite)
+    out_png_frame = out_dir / f"{VIDEO_PATH.stem}_alpha_max_t{int(best_time_s)}s.png"
+    cv2.imwrite(str(out_png_frame), best_frame_bgr)  # BGR accepté par OpenCV
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
