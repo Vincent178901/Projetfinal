@@ -1,0 +1,65 @@
+# run_gray8_and_offsets.py
+# Pour chaque image de images_test/Tests/filtres_bilat_#2 :
+#   - conversion en gris 8 bits
+#   - soustraction d'un offset (20, 40, 60)
+# Sauvegarde dans images_test/Tests/filtre_offset#3
+
+from pathlib import Path
+import cv2
+import numpy as np
+
+IN_FOLDER  = "filtres_bilat_#2"
+OUT_FOLDER = "filtre_offset#3"
+OFFSETS    = [20, 40, 60]  # niveaux à soustraire
+
+def to_gray_uint8(img):
+    # couleur -> gris
+    if img.ndim == 3 and img.shape[2] >= 3:
+        g = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+    else:
+        g = img.copy()
+    # forcer uint8
+    if g.dtype != np.uint8:
+        g = cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    return g
+
+def main():
+    # Suppose le script est dans PROJETFINAL/Algos/
+    root    = Path(__file__).resolve().parents[1]  # → PROJETFINAL
+    in_dir  = root / "images_test" / "Tests" / "filtres_bilat_#2"
+    out_dir = root / "images_test" / "Tests" / "filtre_offset#3"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Récupère PNG/JPG/JPEG
+    in_paths = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp"):
+        in_paths += list(in_dir.glob(ext))
+    in_paths = sorted(in_paths)
+
+    if not in_paths:
+        raise SystemExit(f"Aucune image trouvée dans : {in_dir}")
+
+    for p in in_paths:
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"[!] Lecture impossible: {p}")
+            continue
+
+        gray8 = to_gray_uint8(img)
+        base = p.stem  # sans extension
+
+        # Sauvegarde la version gray 8 bits (utile pour vérif)
+        cv2.imwrite(str(out_dir / f"{base}_gray8.png"), gray8)
+
+        # Soustractions d'offsets
+        for off in OFFSETS:
+            sub = cv2.subtract(gray8, off)  # écrêtage auto à 0
+            out_name = f"{base}_gray8_sub{off}.png"
+            cv2.imwrite(str(out_dir / out_name), sub)
+
+        print(f"[OK] {p.name} → {out_dir}")
+
+    print("\n✅ Terminé. Résultats dans :", out_dir)
+
+if __name__ == "__main__":
+    main()

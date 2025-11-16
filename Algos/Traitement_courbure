@@ -1,0 +1,139 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# Construire le chemin comme dans ton code
+root = Path(__file__).resolve().parents[1]
+in_dir = root / "images_test" / "Tests"
+
+img_path = in_dir / "edge_579.png"
+img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+
+if img is None:
+    print(f"Erreur : impossible de charger l'image à {img_path}")
+    exit()
+
+print(f"✓ Image chargée : shape = {img.shape}")
+
+# ===================================================================
+# PIPELINE DE TRAITEMENT
+# ===================================================================
+
+# Stocker toutes les images intermédiaires
+images_etapes = {}
+images_etapes['1. Image originale'] = img.copy()
+
+# 1. Prétraitement - médian pour réduire le bruit des stries
+img_med = cv2.medianBlur(img, 5)
+images_etapes['2. Filtre médian 5x5'] = img_med.copy()
+print("✓ Filtrage médian appliqué")
+
+# 2. Filtre moyenneur 10x10 de 150 passes
+img_smooth = img_med.copy()
+kernel_size = (10, 10)
+
+print("Début du filtrage moyenneur 10x10 (150 passes)...")
+for i in range(150):
+    img_smooth = cv2.blur(img_smooth, kernel_size)
+    if (i + 1) % 5 == 0:
+        print(f"  ✓ Passe {i + 1}/150 terminée")
+
+images_etapes['3. Moyenneur 10x10 (150 passes)'] = img_smooth.copy()
+print("✓ Filtrage moyenneur terminé (150 passes)")
+
+# 2.5 NOUVEAU: Filtre bilatéral fort
+print("Application du filtre bilatéral fort...")
+img_bilateral = cv2.bilateralFilter(img_smooth, d=15, sigmaColor=150, sigmaSpace=150)
+images_etapes['3.5. Filtre bilatéral fort'] = img_bilateral.copy()
+print("✓ Filtre bilatéral appliqué")
+print(f"   d=15, sigmaColor=150, sigmaSpace=150")
+
+# 3. Offset de -50 niveaux
+img_offset = np.clip(img_bilateral.astype(np.int16) - 50, 0, 255).astype(np.uint8)
+images_etapes['4. Offset -50 niveaux'] = img_offset.copy()
+print("✓ Offset de -50 niveaux appliqué")
+
+# 3.5 NOUVEAU: Filtre moyenneur 30x30 de 10 passes après l'offset
+img_smooth_post = img_offset.copy()
+kernel_size_post = (10, 10)
+
+print("Début du filtrage moyenneur 10x10 (100 passes) post-offset...")
+for i in range(40):
+    img_smooth_post = cv2.blur(img_smooth_post, kernel_size_post)
+    if (i + 1) % 5 == 0:
+        print(f"  ✓ Passe {i + 1}/100 terminée")
+
+images_etapes['4.5. Moyenneur 10x10 (100 passes)'] = img_smooth_post.copy()
+print("✓ Filtrage moyenneur post-offset terminé (100 passes)")
+
+# 4. Filtre médian 5x5 après le moyenneur
+img_med_post = cv2.medianBlur(img_smooth_post, 5)
+images_etapes['4.7. Filtre médian 5x5 '] = img_med_post.copy()
+print("✓ Filtrage médian 5x5 appliqué après moyenneur")
+
+# 5. Filtre morphologique (ouverture)
+kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+img_morph = cv2.morphologyEx(img_med_post, cv2.MORPH_OPEN, kernel_morph)
+images_etapes['5. Ouverture morphologique'] = img_morph.copy()
+print("✓ Filtre morphologique (ouverture) appliqué")
+
+# 6. Seuillage binaire (<50 = noir, >=50 = blanc)
+_, img_binary = cv2.threshold(img_morph, 50, 255, cv2.THRESH_BINARY)
+images_etapes['6. Seuillage binaire (seuil=50)'] = img_binary.copy()
+print("✓ Seuillage binaire appliqué (seuil = 50)")
+print(f"   Pixels blancs: {100*np.sum(img_binary == 255)/img_binary.size:.1f}%")
+
+# ===================================================================
+# VISUALISATION DE TOUTES LES ÉTAPES
+# ===================================================================
+
+# Calculer le nombre de lignes nécessaires (4 images par ligne)
+n_images = len(images_etapes)
+n_cols = 5
+n_rows = int(np.ceil(n_images / n_cols))
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6*n_rows))
+axes = axes.flatten()
+
+for idx, (titre, image) in enumerate(images_etapes.items()):
+    if idx < len(axes):
+        axes[idx].imshow(image, cmap='gray', vmin=0, vmax=255)
+        axes[idx].set_title(titre, fontsize=11, fontweight='bold')
+        axes[idx].axis('off')
+
+# Masquer les axes non utilisés
+for idx in range(len(images_etapes), len(axes)):
+    axes[idx].axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print(f"\n✓ Visualisation complète: {len(images_etapes)} étapes affichées")
+
+# ===================================================================
+# SAUVEGARDE DES RÉSULTATS
+# ===================================================================
+
+output_dir = Path('/mnt/user-data/outputs')
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Sauvegarder toutes les images intermédiaires
+for nom, image in images_etapes.items():
+    # Nettoyer le nom de fichier
+    nom_fichier = nom.replace(' ', '_').replace('.', '').replace('/', '_').replace('(', '').replace(')', '')
+    cv2.imwrite(str(output_dir / f'{nom_fichier}.png'), image)
+
+print(f"✓ Toutes les images sauvegardées dans {output_dir}")
+
+
+
+
+
+
+
+
+
+
+
+

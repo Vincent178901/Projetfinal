@@ -5,105 +5,43 @@ import cv2
 
 def find_boundary_points(binary_image):
     """
-    Trouve UN SEUL point rouge par ligne (lecture de gauche à droite):
-    
-    Condition 3 (vérifiée en premier): Si aucun pixel blanc n'est espacé de plus de 100 pixels
-    d'un autre pixel blanc (avant ou après) → aucun point rouge (zone trop dense)
-    
-    Condition 2: Si les 200 premiers pixels ne contiennent PAS de pixel blanc 
-    → point rouge = premier pixel blanc de la ligne
-    
-    Condition 1: Sinon → point rouge = premier pixel blanc qui marque le début 
-    d'une zone dense (transition noir → blanc)
+    Trouve UN SEUL point rouge par ligne:
+    1. Si les 2000 premiers pixels ne contiennent AUCUN blanc → premier pixel blanc de la ligne
+    2. Sinon → dernier pixel blanc qui n'a PAS de blanc dans les 2000 pixels suivants
     """
     h, w = binary_image.shape
     boundary_points = []
     
     for y in range(h):
-        row = binary_image[y, :]  # Lecture de gauche à droite (index 0 à w-1)
-        
+        row = binary_image[y, :]
         # Trouver tous les pixels blancs (255)
         white_pixels = np.where(row == 255)[0]
         
         if len(white_pixels) == 0:
             continue  # Pas de pixel blanc sur cette ligne
         
-        # CONDITION 3: Vérifier si la ligne est une zone dense en blanc
-        # Critère 1: Tous les pixels blancs ont un voisin dans les 100 pixels
-        all_have_neighbors = True
-        for i, x in enumerate(white_pixels):
-            has_neighbor = False
-            
-            # Vérifier dans les 100 pixels avant
-            if i > 0 and (x - white_pixels[i-1]) <= 100:
-                has_neighbor = True
-            
-            # Vérifier dans les 100 pixels après
-            if i < len(white_pixels) - 1 and (white_pixels[i+1] - x) <= 100:
-                has_neighbor = True
-            
-            # Si ce pixel n'a pas de voisin dans les 100 pixels, la zone n'est pas dense
-            if not has_neighbor:
-                all_have_neighbors = False
-                break
-        
-        # Critère 2: Vérifier si les pixels blancs sont dispersés sur toute la ligne
-        # Si chaque tranche de 100 pixels contient au moins 1 pixel blanc → ligne dispersée
-        num_segments = w // 100
-        segments_with_white = 0
-        
-        for seg in range(num_segments):
-            start_x = seg * 100
-            end_x = start_x + 100
-            # Vérifier si cette tranche contient des pixels blancs
-            has_white_in_segment = any((start_x <= x < end_x) for x in white_pixels)
-            if has_white_in_segment:
-                segments_with_white += 1
-        
-        # Si la majorité des segments (>70%) contiennent du blanc → ligne dispersée
-        if num_segments > 0 and (segments_with_white / num_segments) > 0.7:
-            # Pixels blancs dispersés sur toute la ligne → aucun point rouge
-            continue
-        
-        # Critère 3: La ligne contient trop de pixels blancs (>40% de la largeur)
-        white_density = len(white_pixels) / w
-        
-        if all_have_neighbors or white_density > 0.4:
-            # Zone trop dense → aucun point rouge sur cette ligne
-            continue
-        
-        # CONDITION 2: Si les 200 premiers pixels ne contiennent PAS de pixel blanc
+        # Règle 1: Si aucun blanc dans les 2000 premiers pixels
         first_white = white_pixels[0]
-        if first_white >= 200:
-            # Prendre le premier pixel blanc de la ligne
+        if first_white >= 2000:
+            # Prendre le premier pixel blanc
             boundary_points.append((first_white, y))
             continue
         
-        # CONDITION 1: Trouver la vraie frontière = transition de noir vers blanc
-        # Chercher le premier pixel blanc qui a des pixels noirs avant lui
-        # ET une zone blanche continue après lui
+        # Règle 2: Chercher le dernier pixel blanc sans blanc dans les 2000 suivants
         valid_point = None
-        for i, x in enumerate(white_pixels):
-            # Vérifier s'il y a du noir juste avant ce pixel blanc
-            # (au moins 50 pixels noirs dans les 100 pixels précédents)
-            black_count = 0
-            for offset in range(1, min(101, x + 1)):
-                check_x = x - offset
-                if check_x >= 0 and row[check_x] == 0:
-                    black_count += 1
+        for x in white_pixels:
+            # Vérifier les 2000 pixels suivants
+            has_white_after = False
+            for offset in range(1, 2001):
+                next_x = x + offset
+                if next_x < w:
+                    if row[next_x] == 255:
+                        has_white_after = True
+                        break
             
-            # Vérifier s'il y a du blanc après (zone blanche continue)
-            # Compter les pixels blancs dans les 200 pixels suivants
-            white_after_count = 0
-            for offset in range(0, min(201, w - x)):
-                check_x = x + offset
-                if check_x < w and row[check_x] == 255:
-                    white_after_count += 1
-            
-            # Si on a beaucoup de noir avant ET beaucoup de blanc après, c'est la frontière
-            if black_count >= 50 and white_after_count >= 60:
-                valid_point = (x, y)
-                break  # Prendre le PREMIER qui satisfait cette condition
+            # Si aucun blanc dans les 2000 suivants, c'est un candidat valide
+            if not has_white_after:
+                valid_point = (x, y)  # Garder le dernier trouvé
         
         # Ajouter le point valide s'il existe
         if valid_point is not None:
@@ -118,9 +56,9 @@ def visualize_boundary(original_gray, binary_image, boundary_points):
     # Convertir en BGR pour afficher en couleur
     vis = cv2.cvtColor(original_gray, cv2.COLOR_GRAY2BGR)
     
-    # Dessiner les points de frontière en rouge (plus gros)
+    # Dessiner les points de frontière en rouge
     for (x, y) in boundary_points:
-        cv2.circle(vis, (x, y), 5, (0, 0, 255), -1)  # Rouge en BGR, rayon 5
+        cv2.circle(vis, (x, y), 2, (0, 0, 255), -1)  # Rouge en BGR
     
     return vis
 
@@ -168,11 +106,11 @@ def draw_smooth_curve(original_gray, boundary_points, window_size=50):
     
     return vis
 
-def threshold_image(gray, threshold=100):
+def threshold_image(gray, threshold=150):
     """
     Applique un seuillage simple:
-    - <= threshold (100) : noir complet (0)
-    - > threshold (100) : blanc complet (255)
+    - <= threshold (150) : noir complet (0)
+    - > threshold (150) : blanc complet (255)
     """
     result = np.zeros_like(gray)
     
@@ -183,7 +121,7 @@ def threshold_image(gray, threshold=100):
     
     return result
 
-def process_image(image_path, threshold=100, window_size=50, show=True, save=False):
+def process_image(image_path, threshold=150, window_size=50, show=True, save=False):
     """
     Charge l'image, applique le seuillage et affiche/sauvegarde le résultat.
     """
@@ -261,7 +199,7 @@ if __name__ == "__main__":
         description="Seuillage binaire avec détection de frontière (seuil 2000) et courbe lissée"
     )
     p.add_argument("--img", type=str, default=None, help="Chemin de l'image")
-    p.add_argument("--threshold", type=int, default=100, help="Valeur de seuil (défaut: 100)")
+    p.add_argument("--threshold", type=int, default=150, help="Valeur de seuil (défaut: 150)")
     p.add_argument("--window-size", type=int, default=50, help="Taille de fenêtre pour lissage courbe (défaut: 50)")
     p.add_argument("--no-show", action="store_true", help="Ne pas afficher l'image")
     p.add_argument("--save", action="store_true", help="Sauvegarder l'image résultat")
@@ -288,20 +226,6 @@ if __name__ == "__main__":
         show=not args.no_show,
         save=args.save
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -1,0 +1,46 @@
+# run_bilateral_on_moyenneur_outputs.py
+# Lit toutes les images de images_test/Tests/filtres_moyenneur/
+# Applique SEULEMENT un filtre bilatéral (plusieurs intensités)
+# Écrit les résultats dans images_test/Tests/filtres_bilat_from_moyenneur/
+
+from pathlib import Path
+import cv2
+
+# ---- Intensités à tester (sigmaColor, sigmaSpace) ----
+BIL_PARAMS = [
+    (10, 3),
+    (25, 5),
+    (40, 7),
+    (60, 8),
+    (80,10),
+    (100,12),
+]
+
+def main():
+    root = Path(__file__).resolve().parents[1]   # ← remonte à PROJETFINAL
+    in_dir  = root / "images_test" / "Tests" / "filtres_moyenneur"
+    out_dir = root / "images_test" / "Tests" / "filtres_bilat_#2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    in_paths = sorted(list(in_dir.glob("*.png"))) + sorted(list(in_dir.glob("*.jpg"))) + sorted(list(in_dir.glob("*.jpeg")))
+    if not in_paths:
+        raise SystemExit(f"Aucune image trouvée dans {in_dir}")
+
+    for p in in_paths:
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"[!] Lecture impossible: {p}")
+            continue
+
+        base, ext = p.stem, p.suffix
+        for sc, ss in BIL_PARAMS:
+            out = cv2.bilateralFilter(img, d=0, sigmaColor=sc, sigmaSpace=ss)
+            out_name = f"{base}_bilat_sc{sc}_ss{ss}{ext}"
+            cv2.imwrite(str(out_dir / out_name), out)
+
+        print(f"[OK] {p.name} → {out_dir}")
+
+    print("\n✅ Terminé. Résultats dans :", out_dir)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,251 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ========================================
+#  CONFIG & CHEMINS (Québec style)
+# ========================================
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent
+in_dir = project_root / "images_test" / "Tests"
+img_path = in_dir / "edge_579.png"
+
+if not img_path.exists():
+    print(f"ERREUR : Image manquante → {img_path}")
+    exit()
+
+print(f"Image chargée : {img_path}")
+
+# ========================================
+#  CHARGEMENT & PRÉTRAITEMENT
+# ========================================
+img_raw = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+if img_raw is None:
+    print("Impossible de lire l'image.")
+    exit()
+
+h, w = img_raw.shape
+
+# 0. Normalisation
+img_norm = cv2.normalize(img_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+# 1. Subtract background
+bg = cv2.morphologyEx(img_norm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50,50)))
+subtract_img = cv2.subtract(img_norm, bg)
+
+# 2. Seuillage
+binary = np.zeros_like(subtract_img)
+binary[subtract_img > 7] = 255
+
+# 3. Médian ×3
+for _ in range(3):
+    binary = cv2.medianBlur(binary, 11)
+
+# 4. Fermeture
+closing_img = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((30,30), np.uint8))
+
+# ========================================
+#  CONTOUR & FIT PARABOLIQUE
+# ========================================
+contours, _ = cv2.findContours(closing_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+if not contours:
+    print("Aucun contour trouvé.")
+    exit()
+
+contour = max(contours, key=cv2.contourArea)[:, 0, :]
+x_c, y_c = contour[:, 0], contour[:, 1]
+idx = np.argsort(x_c)
+x_sort, y_sort = x_c[idx], y_c[idx]
+
+margin = 30
+mask = (x_sort > margin) & (x_sort < w - margin) & (y_sort > margin) & (y_sort < h - margin)
+x_fit, y_fit = x_sort[mask], y_sort[mask]
+
+if len(x_fit) < 10:
+    print("Pas assez de points pour le fit.")
+    exit()
+
+poly = np.poly1d(np.polyfit(x_fit, y_fit, 2))
+
+# Courbe lisse
+x_dense = np.linspace(x_fit.min(), x_fit.max(), 1000)
+y_dense = poly(x_dense).astype(int)
+curve_pts = np.column_stack((x_dense, y_dense))
+
+# Point central
+center_mass = np.mean(contour, axis=0).astype(int)
+dists = np.linalg.norm(curve_pts - center_mass, axis=1)
+mid_idx = np.argmin(dists)
+mid_x, mid_y = x_dense[mid_idx], y_dense[mid_idx]
+mid_pt = (int(mid_x), int(mid_y))
+
+# ========================================
+#  TANGENTE & NORMALE INTÉRIEURE
+# ========================================
+deriv = np.polyder(poly)
+slope = deriv(mid_x)
+angle_tan = np.arctan(slope)
+dx_t, dy_t = np.cos(angle_tan), np.sin(angle_tan)
+
+n1 = np.array([-dy_t, dx_t])
+n2 = np.array([dy_t, -dx_t])
+
+p1 = np.array(mid_pt) + 60 * n1
+p2 = np.array(mid_pt) + 60 * n2
+p1f = tuple(np.clip(p1, [0,0], [w-1,h-1]).astype(np.float32))
+p2f = tuple(np.clip(p2, [0,0], [w-1,h-1]).astype(np.float32))
+
+inside1 = cv2.pointPolygonTest(contour, p1f, False)
+inside2 = cv2.pointPolygonTest(contour, p2f, False)
+
+if inside1 > 0:
+    dx_n, dy_n = n1
+elif inside2 > 0:
+    dx_n, dy_n = n2
+else:
+    def count_white(s, e):
+        line = np.zeros_like(closing_img)
+        cv2.line(line, s, e, 1, 3)
+        return np.sum((line > 0) & (closing_img > 0))
+    c1 = count_white(mid_pt, tuple(p1.astype(int)))
+    c2 = count_white(mid_pt, tuple(p2.astype(int)))
+    dx_n, dy_n = n1 if c1 > c2 else n2
+
+norm = np.hypot(dx_n, dy_n)
+if norm > 0:
+    dx_n, dy_n = dx_n/norm, dy_n/norm
+
+# ========================================
+#  CALCUL ANGLE DEPUIS HORIZONTALE DROITE (3h)
+# ========================================
+# IMPORTANT: En OpenCV, Y croît vers le BAS, donc on inverse dy_n
+# Angle anti-horaire depuis horizontale droite = arctan2(-dy, dx)
+angle_ccw_from_horizontal = np.degrees(np.arctan2(-dy_n, dx_n))
+
+# Normaliser pour avoir un angle entre 0° et 360°
+if angle_ccw_from_horizontal < 0:
+    angle_ccw_from_horizontal += 360
+
+display_angle = angle_ccw_from_horizontal
+
+print(f"\nANGLE DEPUIS HORIZONTALE (3h sur horloge) : {display_angle:.2f}°")
+print(f"Direction vecteur bleu: dx={dx_n:.3f}, dy={dy_n:.3f}")
+
+# ========================================
+#  SUPERPOSITION VISUELLE
+# ========================================
+overlay = cv2.cvtColor(img_raw, cv2.COLOR_GRAY2BGR)
+cv2.drawContours(overlay, [contour], -1, (0, 255, 255), 2)
+
+# Courbe rouge lissée
+for i in range(len(x_dense)-1):
+    cv2.line(overlay, (int(x_dense[i]), int(y_dense[i])),
+             (int(x_dense[i+1]), int(y_dense[i+1])), (0, 0, 255), 3)
+
+# Point central
+cv2.circle(overlay, mid_pt, 16, (0, 0, 255), -1)
+cv2.circle(overlay, mid_pt, 16, (0, 0, 0), 3)
+
+# Tangente (bleu clair)
+cv2.line(overlay,
+         (int(mid_x - 50*dx_t), int(mid_y - 50*dy_t)),
+         (int(mid_x + 50*dx_t), int(mid_y + 50*dy_t)),
+         (255, 0, 0), 5)
+
+# Vecteur bleu foncé (normale)
+cv2.arrowedLine(overlay, mid_pt,
+                (int(mid_x + 150*dx_n), int(mid_y + 150*dy_n)),
+                (200, 0, 0), 8, tipLength=0.25)
+
+# Ligne pointillée verte HORIZONTALE DROITE (référence 0°)
+for i in range(0, 80, 10):
+    cv2.line(overlay, (mid_pt[0] + i, mid_pt[1]), (mid_pt[0] + i + 5, mid_pt[1]), (0, 255, 0), 3)
+
+# Marquer la direction de référence (0°)
+cv2.putText(overlay, "0°", (mid_pt[0] + 85, mid_pt[1] + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+# ========================================
+#  ARC VERT: DEPUIS HORIZONTALE VERS VECTEUR BLEU
+# ========================================
+arc_radius = 60
+
+# Point de fin sur le vecteur bleu
+end_pt = (int(mid_pt[0] + arc_radius * dx_n), int(mid_pt[1] + arc_radius * dy_n))
+
+# OpenCV: angles positifs = sens horaire, angles négatifs = anti-horaire
+# Pour un arc anti-horaire depuis horizontale jusqu'au vecteur:
+# On part du vecteur (angle négatif) et on va vers 0° (horizontale)
+cv2.ellipse(
+    overlay, mid_pt, (arc_radius, arc_radius), 0,
+    startAngle=-display_angle,
+    endAngle=0,
+    color=(0, 255, 0),
+    thickness=5
+)
+
+# Point de fin (sur le vecteur bleu)
+cv2.circle(overlay, end_pt, 8, (0, 0, 255), -1)  # rouge
+cv2.circle(overlay, end_pt, 8, (0, 255, 0), 3)   # contour vert
+
+# Flèche de direction au milieu de l'arc
+mid_arc_angle_rad = np.radians(display_angle / 2)
+mid_arc_x = mid_pt[0] + arc_radius * np.cos(mid_arc_angle_rad)
+mid_arc_y = mid_pt[1] - arc_radius * np.sin(mid_arc_angle_rad)  # - car Y croît vers le bas
+arrow_start = (int(mid_arc_x), int(mid_arc_y))
+# Tangente à l'arc (perpendiculaire au rayon)
+tangent = np.array([-np.sin(mid_arc_angle_rad), np.cos(mid_arc_angle_rad)])
+arrow_end = (int(arrow_start[0] - 25 * tangent[0]), int(arrow_start[1] + 25 * tangent[1]))
+cv2.arrowedLine(overlay, arrow_start, arrow_end, (0, 255, 0), 3, tipLength=0.3)
+
+# Texte angle
+angle_text = f"{display_angle:.1f}°"
+text_x = mid_pt[0] + int(70 * np.cos(np.radians(display_angle / 2)))
+text_y = mid_pt[1] - int(70 * np.sin(np.radians(display_angle / 2)))
+cv2.putText(overlay, angle_text, (text_x - 30, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
+
+# Cercle complet 360° (référence)
+cv2.circle(overlay, mid_pt, arc_radius, (100, 100, 100), 2)
+
+# ========================================
+#  VALIDATION GÉOMÉTRIQUE
+# ========================================
+prop = display_angle / 360
+expected_len = prop * 2 * np.pi * arc_radius
+seg_idx = np.where((x_dense > mid_x - 80) & (x_dense < mid_x + 80))[0]
+detected_len = cv2.arcLength(curve_pts[seg_idx].astype(np.int32), False) if len(seg_idx) > 10 else expected_len * 0.8
+coherence = min(expected_len/detected_len, detected_len/expected_len) if detected_len > 0 else 0
+
+print(f"\nVALIDATION FINALE")
+print(f"   Angle depuis horizontale : {display_angle:.2f}°")
+print(f"   Arc attendu              : {expected_len:.1f}px")
+print(f"   Arc détecté              : {detected_len:.1f}px")
+print(f"   Cohérence                : {coherence:.3f} → ", end="")
+print("PARFAIT" if coherence > 0.9 else "BON" if coherence > 0.7 else "À VÉRIFIER")
+
+# ========================================
+#  AFFICHAGE FINAL
+# ========================================
+results = [
+    ("Fermeture", closing_img),
+    ("Angle mesuré", overlay),
+]
+
+plt.figure(figsize=(16, 7))
+for i, (title, img) in enumerate(results):
+    plt.subplot(1, 2, i + 1)
+    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else img, cmap='gray')
+    plt.title(title, fontsize=14, pad=15)
+    plt.axis('off')
+
+plt.suptitle(
+    f"Angle mesuré : {display_angle:.1f}°",
+    fontsize=20, y=0.98, color='lime', weight='bold'
+)
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.show()
+
+print(f"\nC'EST FINI, TABARNAK ! Angle depuis horizontale: {display_angle:.1f}°")
+print(f"→ Cohérence: {coherence:.3f}")

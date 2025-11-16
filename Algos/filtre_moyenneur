@@ -1,0 +1,49 @@
+# run_boxblur_only.py
+# Applique uniquement un filtre moyenneur (box blur)
+# sur Edge_579.png et edge_g_1000.png
+# Résultats enregistrés dans images_test/Tests/filtres_moyenneur/
+
+from pathlib import Path
+import cv2
+
+# ---------- Paramètres ----------
+KSIZE  = (31, 31)   # taille du noyau (flou moyen)
+PASSES = 50         # nombre de passes répétées
+BORDER = cv2.BORDER_REPLICATE
+
+def box_multi(img, ksize=(31,31), passes=1, border=BORDER):
+    """Filtre moyenneur appliqué plusieurs fois."""
+    out = img
+    for _ in range(int(passes)):
+        out = cv2.blur(out, ksize, borderType=border)
+    return out
+
+# ---------- Main ----------
+def main():
+    root   = Path(__file__).resolve().parents[1]  # ← remonte à PROJETFINAL
+    in_dir = root / "images_test" / "Tests"
+    out_dir = in_dir / "filtres_moyenneur"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    in_paths = [in_dir / "Edge_579.png", in_dir / "edge_g_1000.png"]
+
+    for p in in_paths:
+        if not p.exists():
+            print(f"[!] Introuvable: {p}")
+            continue
+
+        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"[!] Lecture impossible: {p}")
+            continue
+
+        out = box_multi(img, ksize=KSIZE, passes=PASSES, border=BORDER)
+        base = p.stem
+        cv2.imwrite(str(out_dir / f"{base}_mean{KSIZE[0]}x{KSIZE[1]}_{PASSES}passes.png"), out)
+
+        print(f"[OK] {p.name} → {out_dir}")
+
+    print("\n✅ Terminé. Résultats dans :", out_dir)
+
+if __name__ == "__main__":
+    main()
