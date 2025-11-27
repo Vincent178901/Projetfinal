@@ -1,303 +1,231 @@
-from pathlib import Path
-import argparse
-import numpy as np
+# ================================================
+#  DÉTECTEUR D'ANGLE DE FIBRE – VERSION ANTI-SATURATION 2025
+#  Fonctionne même si l'image est blanche comme un flash de soudeur
+# ================================================
+
 import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-# --- Utils ajoutés ---
-def midpoint_on_curve(model, img_h):
-    """Point à mi-hauteur de l'image sur la courbe x(y)=ay^2+by+c."""
-    a, b, c = model
-    y = (img_h - 1) / 2.0
-    x = a * y * y + b * y + c
-    return float(x), float(y)
+# ========================================
+#  CHEMINS (à toi de vérifier que edge_1.png est bien là)
+# ========================================
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent
+in_dir = project_root / "images_test" / "Tests"
+img_path = in_dir / "edge_1.png"
 
-def clamp_point_to_image(x, y, w, h):
-    """Clippe un point dans [0,w-1]x[0,h-1] et renvoie des entiers."""
-    xi = int(round(min(max(x, 0), w - 1)))
-    yi = int(round(min(max(y, 0), h - 1)))
-    return xi, yi
+if not img_path.exists():
+    print(f"Image manquante → {img_path}")
+    exit()
 
-# --- Convert-to-Mask (type Fiji) ---
-def convert_to_mask(gray, thresh=None, invert=False, close_kernel=5):
-    if thresh is None:
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+print(f"Image chargée → {img_path.name}")
+
+# ========================================
+#  CHARGEMENT + DÉSATURATION DE COMPÉTITION
+# ========================================
+img_raw = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+if img_raw is None:
+    print("Impossible de lire l'image.")
+    exit()
+
+h, w = img_raw.shape
+print(f"Dimensions : {w} × {h}")
+
+# ──────── LA SAUCE SECRÈTE ANTI-BLANC-CRAMÉ ────────
+print("Désaturation agressive en cours... (Top-Hat + Gamma violent)")
+
+# 1. Top-Hat ultra-puissant pour virer le halo blanc géant
+kernel_size = 91                    # 81-111 → plus gros = plus fort contre la saturation
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+tophat = cv2.morphologyEx(img_raw, cv2.MORPH_TOPHAT, kernel)
+img_clean = cv2.subtract(img_raw, tophat)
+
+# 2. Gamma très bas pour écraser les restes de blanc (0.25 = nucléaire)
+gamma = 0.25
+lut = np.array([((i / 255.0) ** (1 / gamma)) * 255 for i in np.arange(256)]).astype("uint8")
+img_clean = cv2.LUT(img_clean, lut)
+
+# 3. Normalisation finale propre
+img_norm = cv2.normalize(img_clean, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+# Optionnel : léger blur pour enlever les artefacts de Top-Hat
+img_norm = cv2.GaussianBlur(img_norm, (3, 3), 0)
+
+print("Saturation détruite. Fibre retrouvée.")
+
+# ========================================
+#  PRÉTRAITEMENT ROBUSTE (simplifié grâce à la désaturation)
+# ========================================
+# Soustraction fond doux
+bg = cv2.morphologyEx(img_norm, cv2.MORPH_OPEN,
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
+subtract_img = cv2.subtract(img_norm, bg)
+
+# Seuillage (on peut se permettre d'être plus sévère maintenant)
+binary = np.zeros_like(subtract_img)
+binary[subtract_img > 12] = 255
+
+# Nettoyage du bruit
+for _ in range(3):
+    binary = cv2.medianBlur(binary, 11)
+
+# Refermer les petits trous
+closing_img = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((30, 30), np.uint8))
+
+print("Prétraitement terminé – bordure nickel")
+
+# ========================================
+#  CONTOUR & FIT PARABOLIQUE
+# ========================================
+contours, _ = cv2.findContours(closing_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+if not contours:
+    print("Aucun contour trouvé – augmente le gamma ou baisse le kernel_size")
+    exit()
+
+contour = max(contours, key=cv2.contourArea)[:, 0, :]
+x_c, y_c = contour[:, 0], contour[:, 1]
+
+# Tri + nettoyage bordures
+idx = np.argsort(x_c)
+x_sort, y_sort = x_c[idx], y_c[idx]
+margin = 40
+mask = (x_sort > margin) & (x_sort < w - margin) & (y_sort > margin) & (y_sort < h - margin)
+x_fit, y_fit = x_sort[mask], y_sort[mask]
+
+if len(x_fit) < 20:
+    print("Pas assez de points – l'image est trop cramée ?")
+    exit()
+
+# Fit parabole
+poly = np.poly1d(np.polyfit(x_fit, y_fit, 2))
+
+# Courbe lisse 1000 pts
+x_dense = np.linspace(x_fit.min(), x_fit.max(), 1000)
+y_dense = poly(x_dense).astype(int)
+curve_pts = np.column_stack((x_dense.astype(int), y_dense))
+
+# Point médian le plus proche du centre de masse
+center_mass = np.mean(contour, axis=0).astype(int)
+dists = np.linalg.norm(curve_pts - center_mass, axis=1)
+mid_idx = np.argmin(dists)
+mid_x, mid_y = x_dense[mid_idx], y_dense[mid_idx]
+mid_pt = (int(mid_x), int(mid_y))
+
+# ========================================
+#  TANGENTE & NORMALE INTÉRIEURE
+# ========================================
+deriv = np.polyder(poly)
+slope = deriv(mid_x)
+angle_tan = np.arctan(slope)
+dx_t, dy_t = np.cos(angle_tan), np.sin(angle_tan)
+
+# Deux normales possibles
+n1 = np.array([-dy_t, dx_t])
+n2 = np.array([dy_t, -dx_t])
+
+# Test laquelle pointe à l'intérieur
+p1 = np.array(mid_pt) + 80 * n1
+p2 = np.array(mid_pt) + 80 * n2
+p1f = tuple(np.clip(p1, [0,0], [w-1,h-1]).astype(np.float32))
+p2f = tuple(np.clip(p2, [0,0], [w-1,h-1]).astype(np.float32))
+
+inside1 = cv2.pointPolygonTest(contour, p1f, False)
+inside2 = cv2.pointPolygonTest(contour, p2f, False)
+
+if inside1 > 0:
+    dx_n, dy_n = n1
+elif inside2 > 0:
+    dx_n, dy_n = n2
+else:
+    # Fallback robuste
+    def count_white(a, b):
+        line = np.zeros_like(closing_img)
+        cv2.line(line, a, b, 1, 4)
+        return np.sum(line & closing_img > 0)
+    dx_n, dy_n = n1 if count_white(mid_pt, tuple(p1.astype(int))) > count_white(mid_pt, tuple(p2.astype(int))) else n2
+
+# Normalisation vecteur
+norm = np.hypot(dx_n, dy_n)
+if norm > 0:
+    dx_n, dy_n = dx_n / norm, dy_n / norm
+
+# ========================================
+#  ANGLE DEPUIS HORIZONTALE DROITE (3h)
+# ========================================
+angle_ccw_from_horizontal = np.degrees(np.arctan2(-dy_n, dx_n))
+if angle_ccw_from_horizontal < 0:
+    angle_ccw_from_horizontal += 360
+
+display_angle = round(angle_ccw_from_horizontal, 2)
+
+print(f"\nANGLE MESURÉ DEPUIS L'HORIZONTALE (3h) → {display_angle}°")
+
+# ========================================
+#  VISUEL ÉPIQUE
+# ========================================
+overlay = cv2.cvtColor(img_raw, cv2.COLOR_GRAY2BGR)
+
+# Contour jaune
+cv2.drawContours(overlay, [contour], -1, (0, 255, 255), 3)
+
+# Parabole rouge
+cv2.polylines(overlay, [curve_pts], False, (0, 0, 255), 4)
+
+# Point central
+cv2.circle(overlay, mid_pt, 18, (0, 0, 255), -1)
+cv2.circle(overlay, mid_pt, 18, (255, 255, 255), 4)
+
+# Tangente bleue
+cv2.line(overlay, (int(mid_x - 80*dx_t), int(mid_y - 80*dy_t)),
+         (int(mid_x + 80*dx_t), int(mid_y + 80*dy_t)), (255, 100, 0), 6)
+
+# Normale intérieure (flèche rouge → bleue)
+cv2.arrowedLine(overlay, mid_pt,
+                (int(mid_x + 160*dx_n), int(mid_y + 160*dy_n)),
+                (200, 0, 0), 10, tipLength=0.2)
+
+# Référence 0° verte
+for i in range(0, 120, 12):
+    cv2.line(overlay, (mid_pt[0] + i, mid_pt[1]), (mid_pt[0] + i + 8, mid_pt[1]), (0, 255, 0), 5)
+cv2.putText(overlay, "0°", (mid_pt[0] + 130, mid_pt[1] + 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
+
+# Arc vert + texte gros
+arc_radius = 80
+cv2.ellipse(overlay, mid_pt, (arc_radius, arc_radius), 0, -display_angle, 0, (0, 255, 0), 8)
+cv2.putText(overlay, f"{display_angle}°", (mid_pt[0] - 60, mid_pt[1] - 100),
+            cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 255, 0), 6)
+
+# ========================================
+#  RAPPORT FINAL
+# ========================================
+plt.figure(figsize=(18, 10), facecolor='black')
+plt.suptitle(f"ANGLE = {display_angle}° – SATURATION DÉTRUITE, FIBRE SAUVÉE",
+             fontsize=28, color='lime', weight='bold', y=0.95)
+
+imgs = [
+    ("01 – Image brute (cramée)", img_raw),
+    ("02 – Après Top-Hat + Gamma", img_norm),
+    ("03 – Soustraction fond", subtract_img),
+    ("04 – Binaire", binary),
+    ("05 – Fermeture", closing_img),
+    ("06 – RÉSULTAT FINAL", overlay),
+]
+
+for i, (title, img) in enumerate(imgs):
+    plt.subplot(2, 3, i+1)
+    if len(img.shape) == 3:
+        plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     else:
-        _, bw = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY)
-    if invert:
-        bw = 255 - bw
-    if close_kernel < 3:
-        close_kernel = 3
-    if close_kernel % 2 == 0:
-        close_kernel += 1
-    bw = cv2.medianBlur(bw, 5)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((close_kernel, close_kernel), np.uint8))
-    return bw
-
-# --- Frontière (transition 0->1 par ligne) ---
-def extract_boundary_points(bw, prefer_left=True):
-    h, w = bw.shape
-    B = (bw > 0).astype(np.uint8)
-    pts = []
-    for y in range(h):
-        row = B[y, :]
-        trans = np.flatnonzero((row[1:] == 1) & (row[:-1] == 0))
-        if trans.size == 0:
-            continue
-        x = int(trans[0]) + 1 if prefer_left else int(trans[-1]) + 1
-        pts.append([x, y])
-    if not pts:
-        raise RuntimeError("Aucune frontière détectée. Ajuste seuil/inversion.")
-    return np.array(pts, dtype=np.float64)
-
-# --- Quadratique x(y) = a y^2 + b y + c (LS + RANSAC) ---
-def fit_quadratic_ls(pts):
-    y = pts[:,1]; x = pts[:,0]
-    A = np.column_stack([y*y, y, np.ones_like(y)])
-    return tuple(np.linalg.lstsq(A, x, rcond=None)[0])  # (a,b,c)
-
-def ransac_quadratic(pts, iters=400, tol=2.5, min_inliers_ratio=0.5):
-    n = len(pts)
-    if n < 6:
-        return fit_quadratic_ls(pts), np.arange(n)
-    rng = np.random.default_rng(0)
-    best = None; best_inl = None
-    for _ in range(iters):
-        idx = rng.choice(n, size=3, replace=False)
-        a,b,c = fit_quadratic_ls(pts[idx])
-        y = pts[:,1]; err = np.abs(pts[:,0] - (a*y*y + b*y + c))
-        inl = np.where(err < tol)[0]
-        if best_inl is None or len(inl) > len(best_inl):
-            best = (a,b,c); best_inl = inl
-    if best_inl is None or len(best_inl) < max(int(min_inliers_ratio*n), 6):
-        return fit_quadratic_ls(pts), np.arange(n)
-    return fit_quadratic_ls(pts[best_inl]), best_inl
-
-# --- Cercle: Taubin + raffinement; fallback par cercle osculateur local ---
-def fit_circle_taubin(pts):
-    x = pts[:,0].astype(np.float64); y = pts[:,1].astype(np.float64)
-    xm, ym = x.mean(), y.mean()
-    u, v = x - xm, y - ym
-    Suu, Svv, Suv = (u*u).sum(), (v*v).sum(), (u*v).sum()
-    Suuu, Svvv = (u*u*u).sum(), (v*v*v).sum()
-    Suvv, Svuu = (u*v*v).sum(), (v*u*u).sum()
-    A = np.array([[Suu, Suv], [Suv, Svv]], dtype=np.float64)
-    b = 0.5*np.array([Suuu + Suvv, Svvv + Svuu], dtype=np.float64)
-    if abs(np.linalg.det(A)) < 1e-12:
-        return np.nan, np.nan, np.nan
-    sol = np.linalg.lstsq(A, b, rcond=None)[0]
-    uc, vc = sol[0], sol[1]
-    cx, cy = xm + uc, ym + vc
-    r = np.sqrt(max(uc*uc + vc*vc + (Suu + Svv)/len(pts), 0.0))
-    return cx, cy, r
-
-def refine_circle_geometric(pts, cx, cy, r, iters=12):
-    P = pts.astype(np.float64)
-    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r)):
-        return cx, cy, r
-    for _ in range(iters):
-        dx, dy = P[:,0]-cx, P[:,1]-cy
-        d = np.sqrt(dx*dx + dy*dy) + 1e-9
-        J = np.column_stack([-(dx/d), -(dy/d), -np.ones_like(d)])
-        resid = d - r
-        step, *_ = np.linalg.lstsq(J, resid, rcond=None)
-        cx += step[0]; cy += step[1]; r += step[2]
-    return cx, cy, r
-
-def osculating_circle_from_quad(model, y0):
-    """Cercle osculateur au point (x(y0), y0) pour x(y)=ay^2+by+c."""
-    a,b,c = model
-    x0 = a*y0*y0 + b*y0 + c
-    x1 = 2*a*y0 + b
-    x2 = 2*a
-    denom = (1.0 + x1*x1)**1.5
-    if denom < 1e-12 or abs(x2) < 1e-12:
-        return np.nan, np.nan, np.nan
-    k = abs(x2) / denom
-    R = 1.0 / k
-    nx = -1.0 / np.sqrt(1.0 + x1*x1)
-    ny =  x1  / np.sqrt(1.0 + x1*x1)
-    sgn = -np.sign(a) if a != 0 else 1.0
-    Cx = x0 + sgn * R * nx
-    Cy = y0 + sgn * R * ny
-    return Cx, Cy, R
-
-# --- Rendus (retournent les images au lieu de sauvegarder) ---
-def draw_curve_overlay(gray, model, color=(0,165,255), thickness=3, mid_pt=None):
-    a,b,c = model
-    h, w = gray.shape
-    ys = np.arange(0, h, 1, dtype=np.float64)
-    xs = (a*ys*ys + b*ys + c)
-    xs = np.clip(xs, 0, w-1).astype(int)
-    poly = np.stack([xs, ys.astype(int)], axis=1)
-    vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    cv2.polylines(vis, [poly], isClosed=False, color=color, thickness=thickness)
-
-    if mid_pt is not None:
-        mx, my = mid_pt
-        mx_i, my_i = clamp_point_to_image(mx, my, w, h)
-        cv2.circle(vis, (mx_i, my_i), 6, (0,0,255), -1, lineType=cv2.LINE_AA)
-
-    return vis, poly
-
-def draw_circle_scaled(circle, ref_poly, target_radius=300, margin=60, show_arc=True,
-                       mid_pt=None, dist_px=None):
-    """Retourne l'image du cercle à échelle réduite."""
-    cx, cy, r = circle
-    H = W = 2*target_radius + 2*margin
-    canvas = np.full((H, W, 3), 255, np.uint8)
-
-    if not (np.isfinite(r) and r > 0):
-        cv2.putText(canvas, "Cercle non stable (rayon invalide)", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2, cv2.LINE_AA)
-        return canvas
-
-    s = float(target_radius) / float(r)
-    cx_disp = margin + target_radius
-    cy_disp = margin + target_radius
-
-    cv2.circle(canvas, (int(round(cx_disp)), int(round(cy_disp))), int(round(target_radius)), (255,0,0), 2)
-    cv2.circle(canvas, (int(round(cx_disp)), int(round(cy_disp))), 3, (0,0,255), -1)
-
-    if show_arc and ref_poly is not None and len(ref_poly) > 1:
-        ref_poly = np.asarray(ref_poly, dtype=np.float64)
-        Xs = s*(ref_poly[:,0] - cx) + cx_disp
-        Ys = s*(ref_poly[:,1] - cy) + cy_disp
-        pts = np.stack([Xs, Ys], axis=1).round().astype(int)
-        m = (pts[:,0]>=0)&(pts[:,0]<W)&(pts[:,1]>=0)&(pts[:,1]<H)
-        pts = pts[m]
-        if len(pts) >= 2:
-            cv2.polylines(canvas, [pts], isClosed=False, color=(0,165,255), thickness=2)
-
-    if mid_pt is not None:
-        mx, my = float(mid_pt[0]), float(mid_pt[1])
-        mx_disp = int(round(s*(mx - cx) + cx_disp))
-        my_disp = int(round(s*(my - cy) + cy_disp))
-        cv2.circle(canvas, (mx_disp, my_disp), 6, (0,0,255), -1, lineType=cv2.LINE_AA)
-        cv2.line(canvas, (int(round(cx_disp)), int(round(cy_disp))), (mx_disp, my_disp), (0,0,0), 2, lineType=cv2.LINE_AA)
-        if dist_px is None:
-            dist_px = float(np.hypot(mx - cx, my - cy))
-        label = f"{dist_px:.2f} px"
-        tx = int(round((mx_disp + cx_disp) / 2)) + 8
-        ty = int(round((my_disp + cy_disp) / 2)) - 8
-        cv2.putText(canvas, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2, cv2.LINE_AA)
-
-    return canvas
-
-# --- Pipeline principal ---
-def process(image_path, thresh=None, invert=False, prefer_left=True,
-            close_kernel=5, iters=400, tol=2.5, minratio=0.5,
-            target_radius=300, margin=60, show_arc=True, thickness=3):
-    gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-
-    bw = convert_to_mask(gray, thresh=thresh, invert=invert, close_kernel=close_kernel)
-    pts = extract_boundary_points(bw, prefer_left=prefer_left)
-    model, inl = ransac_quadratic(pts, iters=iters, tol=tol, min_inliers_ratio=minratio)
-
-    mx, my = midpoint_on_curve(model, img_h=gray.shape[0])
-
-    img_curve, poly = draw_curve_overlay(gray, model, thickness=thickness, mid_pt=(mx, my))
-
-    poly_f = poly.astype(np.float64)
-    cx, cy, r = fit_circle_taubin(poly_f)
-    cx, cy, r = refine_circle_geometric(poly_f, cx, cy, r, iters=12)
-
-    if not (np.isfinite(r) and r > 0):
-        y0 = gray.shape[0]/2.0
-        Cx, Cy, R = osculating_circle_from_quad(model, y0)
-        cx, cy, r = Cx, Cy, R
-
-    dist_px = float(np.hypot(mx - cx, my - cy))
-
-    img_circle = draw_circle_scaled((cx, cy, r), poly, target_radius=target_radius, margin=margin,
-                                    show_arc=show_arc, mid_pt=(mx, my), dist_px=dist_px)
-
-    return img_curve, img_circle
-
-# --- CLI ---
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Courbe lisse -> Cercle virtuel, affichage direct.")
-    p.add_argument("--img", type=str, default=None, help="Chemin image (relatif/absolu).")
-    p.add_argument("--thresh", type=int, default=None, help="Seuil manuel; Otsu si omis.")
-    p.add_argument("--invert", action="store_true", help="Inverser le masque si nécessaire.")
-    p.add_argument("--prefer-right", action="store_true", help="Frontière la plus à droite (défaut: gauche).")
-    p.add_argument("--close-kernel", type=int, default=5)
-    p.add_argument("--iters", type=int, default=400)
-    p.add_argument("--tol", type=float, default=2.5)
-    p.add_argument("--minratio", type=float, default=0.5)
-    p.add_argument("--thickness", type=int, default=3)
-    p.add_argument("--target-radius", type=int, default=300, help="Rayon affiché du cercle (px) sur l'image de sortie.")
-    p.add_argument("--margin", type=int, default=60, help="Marge autour du cercle sur l'image de sortie (px).")
-    p.add_argument("--no-arc", action="store_true", help="Ne pas dessiner l'arc rescalé sur le canevas du cercle.")
-    args = p.parse_args()
-
-    root = Path(__file__).resolve().parents[1]
-    if args.img:
-        img_path = (root / args.img) if not Path(args.img).is_absolute() else Path(args.img)
-        if not img_path.exists():
-            raise SystemExit(f"Image introuvable: {img_path}")
-    else:
-        cands = list((root / "images_test").rglob("edge_45.png"))
-        if not cands:
-            raise SystemExit("'*13.18.26.png' introuvable sous images_test/")
-        img_path = cands[0]
-
-    img_curve, img_circle = process(
-        img_path,
-        thresh=args.thresh,
-        invert=args.invert,
-        prefer_left=not args.prefer_right,
-        close_kernel=args.close_kernel,
-        iters=args.iters,
-        tol=args.tol,
-        minratio=args.minratio,
-        target_radius=args.target_radius,
-        margin=args.margin,
-        show_arc=not args.no_arc,
-        thickness=args.thickness,
-    )
-    
-    # Affichage des 2 images côte à côte
-    cv2.imshow("Courbe superposee", img_curve)
-    cv2.imshow("Cercle virtuel (echelle reduite)", img_circle)
-    print("Appuyez sur une touche pour fermer les fenetres...")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        plt.imshow(img, cmap='gray', vmin=0, vmax=255)
+    plt.title(title, fontsize=16, color='cyan', pad=20)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+print(f"\nMISSION ACCOMPLIE, TABARNAK !")
+print(f"Angle mesuré avec image saturée → {display_angle}°")
+print("Va donc checker ton rapport, c’est beau en ostie.")

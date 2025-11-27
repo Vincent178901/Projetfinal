@@ -9,7 +9,7 @@ from pathlib import Path
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
 in_dir = project_root / "images_test" / "Tests"
-img_path = in_dir / "edge_579.png"
+img_path = in_dir / "edge_1.png"
 
 if not img_path.exists():
     print(f"ERREUR : Image manquante → {img_path}")
@@ -247,5 +247,5 @@ plt.suptitle(
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 plt.show()
 
-print(f"\nC'EST FINI, TABARNAK ! Angle depuis horizontale: {display_angle:.1f}°")
+print(f"\nC'EST FINI! Angle depuis horizontale: {display_angle:.1f}°")
 print(f"→ Cohérence: {coherence:.3f}")

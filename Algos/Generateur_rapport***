@@ -1,0 +1,309 @@
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from reportlab.lib.colors import HexColor
+from PIL import Image
+import io
+import os
+import subprocess
+import platform
+
+def open_pdf(filename):
+    """
+    Ouvre le PDF avec l'application par défaut du système
+    """
+    if not filename:
+        print("⚠ Erreur: Aucun fichier à ouvrir")
+        return
+        
+    try:
+        if platform.system() == 'Darwin':  # macOS
+            subprocess.run(['open', filename], check=True)
+            print(f"✓ PDF ouvert: {filename}")
+        elif platform.system() == 'Windows':
+            os.startfile(filename)
+            print(f"✓ PDF ouvert: {filename}")
+        else:  # Linux
+            subprocess.run(['xdg-open', filename], check=True)
+            print(f"✓ PDF ouvert: {filename}")
+    except Exception as e:
+        print(f"⚠ Impossible d'ouvrir automatiquement le PDF: {e}")
+        print(f"  → Ouvrez manuellement: {os.path.abspath(filename)}")
+
+
+def create_fiber_report_pdf(output_filename="rapport_fibres.pdf"):
+    """
+    Génère un PDF avec la mise en page des connecteurs fibres (VERSION TEMPLATE)
+    """
+    # Pour le template, on crée un PDF simple sans appeler l'autre fonction
+    c = canvas.Canvas(output_filename, pagesize=A4)
+    width, height = A4
+    
+    # En-tête
+    c.setFont("Helvetica", 10)
+    c.drawString(30, height - 40, "Nom du local: [Template]")
+    c.drawString(30, height - 55, "Types: [à définir]")
+    c.drawString(30, height - 70, "Date & l'heure: [Template]")
+    c.drawString(30, height - 85, "Version Assemblage: [Template]")
+    c.drawString(30, height - 100, "Version Logiciel: [Template]")
+    
+    # Titre principal
+    c.setFont("Helvetica", 12)
+    c.drawString(width - 250, height - 50, "Distance fibre-connecteurs & Bum")
+    c.setFont("Helvetica", 10)
+    c.drawString(width - 250, height - 65, "Incertitude & 4 μm")
+    
+    # Configuration
+    img_width = 180
+    img_height = 120
+    center_x = width / 2
+    center_y = height / 2 + 50
+    
+    positions = {
+        'haut': (center_x - img_width/2, center_y + 100, "7.89"),
+        'gauche': (center_x - img_width - 50, center_y - img_height/2, "7.92"),
+        'droite': (center_x + 50, center_y - img_height/2, "7.88"),
+        'bas': (center_x - img_width/2, center_y - img_height - 100, "7.76")
+    }
+    
+    # Cercle central
+    circle_radius = 60
+    c.setStrokeColor(HexColor("#000000"))
+    c.setLineWidth(2)
+    c.circle(center_x, center_y, circle_radius, stroke=1, fill=0)
+    
+    c.setFont("Helvetica", 12)
+    c.setFillColor(HexColor("#FF1493"))
+    c.drawCentredString(center_x, center_y - circle_radius - 20, "757 μm")
+    
+    # Rectangles et valeurs
+    for position, (x, y, value) in positions.items():
+        c.setStrokeColor(HexColor("#000000"))
+        c.setLineWidth(2)
+        c.rect(x, y, img_width, img_height, stroke=1, fill=0)
+        
+        c.setFont("Helvetica", 10)
+        c.setFillColor(HexColor("#666666"))
+        c.drawCentredString(x + img_width/2, y + img_height/2, "[Template]")
+        
+        c.setFont("Helvetica", 14)
+        c.setFillColor(HexColor("#FF1493"))
+        c.drawCentredString(x + img_width/2, y - 20, f"{value} μm")
+    
+    c.save()
+    print(f"PDF généré: {output_filename}")
+    return output_filename
+
+
+def create_fiber_report_with_images(output_filename, laser_name, date_heure, 
+                                    version_assemblage, version_logiciel,
+                                    images_dict, values_dict, image_centre=None):
+    """
+    Génère un PDF avec les vraies données et images
+    
+    Args:
+        output_filename: nom du fichier PDF de sortie
+        local_name: nom du local
+        date_heure: date et heure
+        version_assemblage: version d'assemblage
+        version_logiciel: version du logiciel
+        images_dict: dictionnaire avec clés 'haut', 'gauche', 'droite', 'bas' 
+                     contenant les chemins vers les images
+        values_dict: dictionnaire avec les mêmes clés contenant les valeurs
+        image_centre: chemin vers l'image pour le centre du cercle (optionnel)
+    """
+    c = canvas.Canvas(output_filename, pagesize=A4)
+    width, height = A4
+    
+    # En-tête
+    c.setFont("Helvetica", 10)
+    c.drawString(30, height - 40, f"Nom du laser: {laser_name}")
+    c.drawString(30, height - 55, "Types: [à définir]")
+    c.drawString(30, height - 70, f"Date & l'heure: {date_heure}")
+    c.drawString(30, height - 85, f"Version Assemblage: {version_assemblage}")
+    c.drawString(30, height - 100, f"Version Logiciel: {version_logiciel}")
+    
+    # Titre principal
+    c.setFont("Helvetica", 12)
+    c.drawString(width - 250, height - 50, "Distance fibre-connecteurs : 10 um")
+    c.setFont("Helvetica", 10)
+    c.drawString(width - 250, height - 65, "Incertitude : 4 μm")
+    
+    # Configuration des positions
+    img_width = 150
+    img_height = 150
+    center_x = width / 2
+    center_y = height / 2 + 50
+    
+    positions = {
+        'haut': (center_x - img_width/2, center_y + 100),
+        'gauche': (center_x - img_width - 50, center_y - img_height/2),
+        'droite': (center_x + 50, center_y - img_height/2),
+        'bas': (center_x - img_width/2, center_y - img_height - 100)
+    }
+    
+    # Cercle central
+    circle_radius = 40
+    c.setStrokeColor(HexColor("#000000"))
+    c.setLineWidth(2)
+    c.circle(center_x, center_y, circle_radius, stroke=1, fill=0)
+    
+    # Ajouter l'image centrale si disponible
+    if image_centre and os.path.exists(image_centre):
+        try:
+            # Taille de l'image centrale (plus petite que le cercle)
+            img_centre_size = circle_radius * 1.5
+            c.drawImage(image_centre, 
+                       center_x - img_centre_size/2, 
+                       center_y - img_centre_size/2, 
+                       width=img_centre_size, 
+                       height=img_centre_size, 
+                       preserveAspectRatio=True,
+                       mask='auto')
+        except Exception as e:
+            print(f"⚠ Erreur lors de l'insertion de l'image centrale: {e}")
+    
+    # Texte "757 μm" en dessous du cercle
+    c.setFont("Helvetica", 12)
+    c.setFillColor(HexColor("#FF1493"))
+    c.drawCentredString(center_x, center_y - circle_radius - 15, "757 μm")
+    
+    # Ajouter images et valeurs aux 4 positions
+    for position, (x, y) in positions.items():
+        # Insérer l'image si disponible
+        if position in images_dict and images_dict[position]:
+            try:
+                # Obtenir les dimensions de l'image
+                from PIL import Image as PILImage
+                img = PILImage.open(images_dict[position])
+                img_ratio = img.width / img.height
+                
+                # Calculer les dimensions pour préserver le ratio
+                if img_ratio > 1:  # Image plus large que haute
+                    new_width = img_width
+                    new_height = img_width / img_ratio
+                else:  # Image plus haute que large
+                    new_height = img_height
+                    new_width = img_height * img_ratio
+                
+                # Centrer l'image dans l'espace alloué
+                img_x = x + (img_width - new_width) / 2
+                img_y = y + (img_height - new_height) / 2
+                
+                # Dessiner l'image
+                c.drawImage(images_dict[position], img_x, img_y, 
+                           width=new_width, height=new_height, 
+                           preserveAspectRatio=True)
+                
+                # Dessiner le rectangle autour de l'image réelle
+                c.setStrokeColor(HexColor("#000000"))
+                c.setLineWidth(2)
+                c.rect(img_x, img_y, new_width, new_height, stroke=1, fill=0)
+                
+            except Exception as e:
+                print(f"⚠ Erreur pour l'image {position}: {e}")
+                # Rectangle par défaut en cas d'erreur
+                c.setStrokeColor(HexColor("#000000"))
+                c.setLineWidth(2)
+                c.rect(x, y, img_width, img_height, stroke=1, fill=0)
+                c.setFont("Helvetica", 10)
+                c.setFillColor(HexColor("#666666"))
+                c.drawCentredString(x + img_width/2, y + img_height/2, 
+                                  "[Image non disponible]")
+        else:
+            # Rectangle par défaut si pas d'image
+            c.setStrokeColor(HexColor("#000000"))
+            c.setLineWidth(2)
+            c.rect(x, y, img_width, img_height, stroke=1, fill=0)
+            c.setFont("Helvetica", 10)
+            c.setFillColor(HexColor("#666666"))
+            c.drawCentredString(x + img_width/2, y + img_height/2, 
+                              "[Pas d'image]")
+        
+        # Valeur en dessous du rectangle avec unité μm
+        value = values_dict.get(position, "N/A")
+        c.setFont("Helvetica", 14)
+        c.setFillColor(HexColor("#FF1493"))
+        c.drawCentredString(x + img_width/2, y - 20, f"{value} μm")
+    
+    c.save()
+    print(f"✓ PDF généré: {output_filename}")
+
+
+# Exemple d'utilisation avec vos images du projet
+if __name__ == "__main__":
+    print("🚀 Génération du rapport PDF...\n")
+    
+    # Chemin vers le Bureau Mac
+    bureau = os.path.join(os.path.expanduser("~"), "Desktop")
+    nom_fichier = "rapport_fibres_complet.pdf"
+    chemin_complet = os.path.join(bureau, nom_fichier)
+    
+    # Obtenir le répertoire parent du script (Projectfinal)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    projet_dir = os.path.dirname(script_dir)  # Remonte d'un niveau (de Algos vers Projectfinal)
+    base_path = os.path.join(projet_dir, "images_test", "Tests")
+    
+    print(f"📁 Recherche des images dans: {base_path}\n")
+    
+    # Chemins vers vos images RÉELLES du dossier Tests
+    mes_images = {
+        'haut': os.path.join(base_path, "edge_1.png"),
+        'gauche': os.path.join(base_path, "edge_45.png"),
+        'droite': os.path.join(base_path, "edge_579.png"),
+        'bas': os.path.join(base_path, "edge_g_1000.png")
+    }
+    
+    # Image pour le centre du cercle (optionnel)
+    image_centre = os.path.join(base_path, "edge_1.png")
+    
+    # Vérifier que les images existent
+    print("Vérification des images:")
+    images_trouvees = 0
+    for position, chemin in mes_images.items():
+        if os.path.exists(chemin):
+            print(f"  ✓ {position}: {os.path.basename(chemin)}")
+            images_trouvees += 1
+        else:
+            print(f"  ✗ {position}: {os.path.basename(chemin)} - INTROUVABLE!")
+            print(f"     Chemin complet: {chemin}")
+            mes_images[position] = None
+    
+    # Vérifier l'image centrale
+    if os.path.exists(image_centre):
+        print(f"  ✓ centre: {os.path.basename(image_centre)}")
+    else:
+        print(f"  ✗ centre: Image non trouvée")
+        image_centre = None
+    
+    print(f"\n{images_trouvees}/4 images trouvées\n")
+    
+    mes_valeurs = {
+        'haut': '7.89',
+        'gauche': '7.92',
+        'droite': '7.88',
+        'bas': '7.76'
+    }
+    
+    # Créer le rapport complet
+    create_fiber_report_with_images(
+        chemin_complet,
+        "HeNe",
+        "2025-11-18 14:30:00",
+        "v2.1",
+        "v3.0",
+        mes_images,
+        mes_valeurs,
+        image_centre
+    )
+    
+    # Afficher le résultat
+    print("\n" + "="*60)
+    print("✓ PDF généré avec succès!")
+    print("="*60)
+    print(f"   Emplacement: {chemin_complet}")
+    print("="*60)
+    
+    # Ouvrir le PDF automatiquement
+    print("\n Ouverture du PDF dans Aperçu...")
+    open_pdf(chemin_complet)
